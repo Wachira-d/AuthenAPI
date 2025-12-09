@@ -2,6 +2,7 @@ using AuthenAPI.Models;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Options;
 using Novell.Directory.Ldap;
+using System.Security.Authentication;
 
 namespace AuthenAPI.Services;
 
@@ -385,16 +386,23 @@ public class LdapService : ILdapService
 
     private LdapConnection CreateConnection()
     {
-        var connection = new LdapConnection();
+        var connectionOptions = new LdapConnectionOptions();
+
+        if (_settings.UseSSL)
+        {
+            connectionOptions.ConfigureSslProtocols(SslProtocols.Tls12 | SslProtocols.Tls13);
+
+            if (_settings.SkipCertificateValidation)
+            {
+                connectionOptions.ConfigureRemoteCertificateValidationCallback((sender, certificate, chain, errors) => true);
+            }
+        }
+
+        var connection = new LdapConnection(connectionOptions);
 
         if (_settings.UseSSL)
         {
             connection.SecureSocketLayer = true;
-
-            if (_settings.SkipCertificateValidation)
-            {
-                connection.UserDefinedServerCertValidationDelegate += (sender, certificate, chain, errors) => true;
-            }
         }
 
         // Use milliseconds for timeout
