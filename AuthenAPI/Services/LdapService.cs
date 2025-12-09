@@ -390,7 +390,8 @@ public class LdapService : ILdapService
 
         if (_settings.UseSSL)
         {
-            connectionOptions.ConfigureSslProtocols(SslProtocols.Tls12 | SslProtocols.Tls13);
+            // Include TLS 1.0/1.1 for older AD servers compatibility
+            connectionOptions.ConfigureSslProtocols(SslProtocols.Tls | SslProtocols.Tls11 | SslProtocols.Tls12 | SslProtocols.Tls13);
 
             if (_settings.SkipCertificateValidation)
             {

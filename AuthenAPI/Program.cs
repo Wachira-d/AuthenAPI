@@ -2,8 +2,8 @@ using AuthenAPI.Models;
 using AuthenAPI.Services;
 using System.Net;
 
-// Force TLS 1.2 for LDAPS connections (required for Windows Server 2012 R2)
-ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | SecurityProtocolType.Tls13;
+// Enable all TLS versions for LDAPS connections (AD server may use TLS 1.0)
+ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls | SecurityProtocolType.Tls11 | SecurityProtocolType.Tls12 | SecurityProtocolType.Tls13;
 
 var builder = WebApplication.CreateBuilder(args);
 
