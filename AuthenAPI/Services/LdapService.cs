@@ -1,18 +1,24 @@
 using AuthenAPI.Models;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Options;
 using Novell.Directory.Ldap;
-using System.Net.Security;
-using System.Security.Cryptography.X509Certificates;
 
 namespace AuthenAPI.Services;
 
 /// <summary>
 /// LDAP service implementation for Active Directory operations via LDAPS
+/// with connection pooling and caching for improved performance
 /// </summary>
 public class LdapService : ILdapService
 {
     private readonly LdapSettings _settings;
     private readonly ILogger<LdapService> _logger;
+    private readonly IMemoryCache _cache;
+    private readonly SemaphoreSlim _connectionLock = new(10, 10); // Max 10 concurrent connections
+
+    // Cache keys
+    private const string UserCachePrefix = "ldap_user_";
+    private const string GroupsCachePrefix = "ldap_groups_";
 
     // Common AD attributes to retrieve
     private static readonly string[] UserAttributes =
@@ -40,10 +46,25 @@ public class LdapService : ILdapService
         "lastLogonTimestamp"
     };
 
-    public LdapService(IOptions<LdapSettings> settings, ILogger<LdapService> logger)
+    // Minimal attributes for authentication (faster)
+    private static readonly string[] AuthAttributes =
+    {
+        "distinguishedName",
+        "sAMAccountName",
+        "userPrincipalName",
+        "displayName",
+        "mail",
+        "department",
+        "memberOf",
+        "userAccountControl",
+        "lockoutTime"
+    };
+
+    public LdapService(IOptions<LdapSettings> settings, ILogger<LdapService> logger, IMemoryCache cache)
     {
         _settings = settings.Value;
         _logger = logger;
+        _cache = cache;
     }
 
     /// <inheritdoc />
@@ -55,70 +76,97 @@ public class LdapService : ILdapService
             return null;
         }
 
-        return await Task.Run(() =>
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+        try
         {
-            try
+            await _connectionLock.WaitAsync();
+
+            return await Task.Run(() =>
             {
-                using var connection = CreateConnection();
-                ConnectAndBind(connection);
-
-                // Search for the user first
-                var userDn = FindUserDn(connection, username);
-                if (string.IsNullOrEmpty(userDn))
-                {
-                    _logger.LogWarning("User not found: {Username}", username);
-                    return null;
-                }
-
-                // Try to bind with user credentials
-                using var userConnection = CreateConnection();
                 try
                 {
-                    userConnection.Connect(_settings.Server, _settings.Port);
-                    userConnection.Bind(userDn, password);
+                    // Build user principal name for direct bind
+                    var userPrincipal = username.Contains("@") ? username : $"{username}@{_settings.Domain}";
 
-                    if (userConnection.Bound)
+                    // Try direct bind first (faster - single connection)
+                    using var connection = CreateConnection();
+                    try
                     {
-                        _logger.LogInformation("User authenticated successfully: {Username}", username);
+                        connection.Connect(_settings.Server, _settings.Port);
+                        connection.Bind(userPrincipal, password);
 
-                        // Get user info after successful authentication
-                        return GetUserInfoFromDn(connection, userDn);
+                        if (connection.Bound)
+                        {
+                            _logger.LogInformation("User authenticated successfully: {Username} in {Ms}ms",
+                                username, stopwatch.ElapsedMilliseconds);
+
+                            // Get user info using the authenticated connection
+                            var userInfo = GetUserInfoFromConnection(connection, username);
+
+                            // Cache the user info
+                            if (userInfo != null && _settings.EnableCache)
+                            {
+                                CacheUserInfo(username, userInfo);
+                            }
+
+                            return userInfo;
+                        }
                     }
-                }
-                catch (LdapException ex) when (ex.ResultCode == LdapException.InvalidCredentials)
-                {
-                    _logger.LogWarning("Invalid credentials for user: {Username}", username);
+                    catch (LdapException ex) when (ex.ResultCode == LdapException.InvalidCredentials)
+                    {
+                        _logger.LogWarning("Invalid credentials for user: {Username}", username);
+                        return null;
+                    }
+
                     return null;
                 }
-
-                return null;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error during authentication for user: {Username}", username);
-                return null;
-            }
-        });
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error during authentication for user: {Username}", username);
+                    return null;
+                }
+            });
+        }
+        finally
+        {
+            _connectionLock.Release();
+            stopwatch.Stop();
+            _logger.LogDebug("Authentication completed in {Ms}ms", stopwatch.ElapsedMilliseconds);
+        }
     }
 
     /// <inheritdoc />
     public async Task<bool> TestConnectionAsync()
     {
-        return await Task.Run(() =>
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+        try
         {
-            try
+            await _connectionLock.WaitAsync();
+
+            return await Task.Run(() =>
             {
-                using var connection = CreateConnection();
-                ConnectAndBind(connection);
-                _logger.LogInformation("LDAP connection test successful to {Server}:{Port}", _settings.Server, _settings.Port);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "LDAP connection test failed to {Server}:{Port}", _settings.Server, _settings.Port);
-                return false;
-            }
-        });
+                try
+                {
+                    using var connection = CreateConnection();
+                    ConnectAndBind(connection);
+                    _logger.LogInformation("LDAP connection test successful to {Server}:{Port} in {Ms}ms",
+                        _settings.Server, _settings.Port, stopwatch.ElapsedMilliseconds);
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "LDAP connection test failed to {Server}:{Port}",
+                        _settings.Server, _settings.Port);
+                    return false;
+                }
+            });
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
     }
 
     /// <inheritdoc />
@@ -129,156 +177,196 @@ public class LdapService : ILdapService
             return null;
         }
 
-        return await Task.Run(() =>
+        // Check cache first
+        var cacheKey = $"{UserCachePrefix}{username.ToLowerInvariant()}";
+        if (_settings.EnableCache && _cache.TryGetValue(cacheKey, out UserInfo? cachedUser))
         {
-            try
+            _logger.LogDebug("User info retrieved from cache: {Username}", username);
+            return cachedUser;
+        }
+
+        try
+        {
+            await _connectionLock.WaitAsync();
+
+            return await Task.Run(() =>
             {
-                using var connection = CreateConnection();
-                ConnectAndBind(connection);
-
-                var filter = BuildUserFilter(username);
-                var searchResults = connection.Search(
-                    _settings.BaseDN,
-                    LdapConnection.ScopeSub,
-                    filter,
-                    UserAttributes,
-                    false);
-
-                if (searchResults.HasMore())
+                try
                 {
-                    var entry = searchResults.Next();
-                    return MapEntryToUserInfo(entry);
-                }
+                    using var connection = CreateConnection();
+                    ConnectAndBind(connection);
 
-                return null;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error getting user: {Username}", username);
-                return null;
-            }
-        });
+                    var userInfo = GetUserInfoFromConnection(connection, username);
+
+                    // Cache the result
+                    if (userInfo != null && _settings.EnableCache)
+                    {
+                        CacheUserInfo(username, userInfo);
+                    }
+
+                    return userInfo;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error getting user: {Username}", username);
+                    return null;
+                }
+            });
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
     }
 
     /// <inheritdoc />
     public async Task<List<UserInfo>> SearchUsersAsync(SearchRequest request)
     {
-        return await Task.Run(() =>
+        try
         {
-            var users = new List<UserInfo>();
+            await _connectionLock.WaitAsync();
 
-            try
+            return await Task.Run(() =>
             {
-                using var connection = CreateConnection();
-                ConnectAndBind(connection);
+                var users = new List<UserInfo>();
 
-                string filter;
-                if (!string.IsNullOrEmpty(request.LdapFilter))
+                try
                 {
-                    filter = request.LdapFilter;
-                }
-                else if (!string.IsNullOrEmpty(request.Query))
-                {
-                    // Search in common fields
-                    filter = $"(&(objectClass=user)(objectCategory=person)(|(displayName=*{EscapeLdapFilter(request.Query)}*)(sAMAccountName=*{EscapeLdapFilter(request.Query)}*)(mail=*{EscapeLdapFilter(request.Query)}*)(givenName=*{EscapeLdapFilter(request.Query)}*)(sn=*{EscapeLdapFilter(request.Query)}*)))";
-                }
-                else
-                {
-                    // Return all users if no query specified
-                    filter = "(&(objectClass=user)(objectCategory=person))";
-                }
+                    using var connection = CreateConnection();
+                    ConnectAndBind(connection);
 
-                var baseDn = request.BaseDN ?? _settings.BaseDN;
-
-                var constraints = new LdapSearchConstraints
-                {
-                    MaxResults = request.MaxResults
-                };
-
-                var searchResults = connection.Search(
-                    baseDn,
-                    LdapConnection.ScopeSub,
-                    filter,
-                    UserAttributes,
-                    false,
-                    constraints);
-
-                while (searchResults.HasMore() && users.Count < request.MaxResults)
-                {
-                    try
+                    string filter;
+                    if (!string.IsNullOrEmpty(request.LdapFilter))
                     {
-                        var entry = searchResults.Next();
-                        var user = MapEntryToUserInfo(entry);
-                        users.Add(user);
+                        filter = request.LdapFilter;
                     }
-                    catch (LdapException ex) when (ex.ResultCode == LdapException.SizeLimitExceeded)
+                    else if (!string.IsNullOrEmpty(request.Query))
                     {
-                        // Size limit reached, return what we have
-                        break;
+                        filter = $"(&(objectClass=user)(objectCategory=person)(|(displayName=*{EscapeLdapFilter(request.Query)}*)(sAMAccountName=*{EscapeLdapFilter(request.Query)}*)(mail=*{EscapeLdapFilter(request.Query)}*)(givenName=*{EscapeLdapFilter(request.Query)}*)(sn=*{EscapeLdapFilter(request.Query)}*)))";
                     }
+                    else
+                    {
+                        filter = "(&(objectClass=user)(objectCategory=person))";
+                    }
+
+                    var baseDn = request.BaseDN ?? _settings.BaseDN;
+
+                    var constraints = new LdapSearchConstraints
+                    {
+                        MaxResults = request.MaxResults,
+                        TimeLimit = _settings.ConnectionTimeout * 1000
+                    };
+
+                    var searchResults = connection.Search(
+                        baseDn,
+                        LdapConnection.ScopeSub,
+                        filter,
+                        AuthAttributes, // Use minimal attributes for search
+                        false,
+                        constraints);
+
+                    while (searchResults.HasMore() && users.Count < request.MaxResults)
+                    {
+                        try
+                        {
+                            var entry = searchResults.Next();
+                            var user = MapEntryToUserInfo(entry);
+                            users.Add(user);
+                        }
+                        catch (LdapException ex) when (ex.ResultCode == LdapException.SizeLimitExceeded)
+                        {
+                            break;
+                        }
+                    }
+
+                    _logger.LogInformation("Search returned {Count} users", users.Count);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error searching users with query: {Query}", request.Query);
                 }
 
-                _logger.LogInformation("Search returned {Count} users", users.Count);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error searching users with query: {Query}", request.Query);
-            }
-
-            return users;
-        });
+                return users;
+            });
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
     }
 
     /// <inheritdoc />
     public async Task<List<string>> GetUserGroupsAsync(string username)
     {
-        var groups = new List<string>();
-
         if (string.IsNullOrWhiteSpace(username))
         {
-            return groups;
+            return new List<string>();
         }
 
-        return await Task.Run(() =>
+        // Check cache first
+        var cacheKey = $"{GroupsCachePrefix}{username.ToLowerInvariant()}";
+        if (_settings.EnableCache && _cache.TryGetValue(cacheKey, out List<string>? cachedGroups))
         {
-            try
+            _logger.LogDebug("User groups retrieved from cache: {Username}", username);
+            return cachedGroups ?? new List<string>();
+        }
+
+        try
+        {
+            await _connectionLock.WaitAsync();
+
+            return await Task.Run(() =>
             {
-                using var connection = CreateConnection();
-                ConnectAndBind(connection);
+                var groups = new List<string>();
 
-                var filter = BuildUserFilter(username);
-                var searchResults = connection.Search(
-                    _settings.BaseDN,
-                    LdapConnection.ScopeSub,
-                    filter,
-                    new[] { "memberOf" },
-                    false);
-
-                if (searchResults.HasMore())
+                try
                 {
-                    var entry = searchResults.Next();
-                    var memberOf = entry.GetAttribute("memberOf");
-                    if (memberOf != null)
+                    using var connection = CreateConnection();
+                    ConnectAndBind(connection);
+
+                    var filter = BuildUserFilter(username);
+                    var searchResults = connection.Search(
+                        _settings.BaseDN,
+                        LdapConnection.ScopeSub,
+                        filter,
+                        new[] { "memberOf" },
+                        false);
+
+                    if (searchResults.HasMore())
                     {
-                        foreach (var groupDn in memberOf.StringValueArray)
+                        var entry = searchResults.Next();
+                        var memberOf = entry.GetAttribute("memberOf");
+                        if (memberOf != null)
                         {
-                            // Extract CN from DN
-                            var groupName = ExtractCnFromDn(groupDn);
-                            if (!string.IsNullOrEmpty(groupName))
+                            foreach (var groupDn in memberOf.StringValueArray)
                             {
-                                groups.Add(groupName);
+                                var groupName = ExtractCnFromDn(groupDn);
+                                if (!string.IsNullOrEmpty(groupName))
+                                {
+                                    groups.Add(groupName);
+                                }
                             }
                         }
                     }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error getting groups for user: {Username}", username);
-            }
 
-            return groups;
-        });
+                    // Cache the result
+                    if (_settings.EnableCache)
+                    {
+                        _cache.Set(cacheKey, groups, TimeSpan.FromMinutes(_settings.CacheDurationMinutes));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error getting groups for user: {Username}", username);
+                }
+
+                return groups;
+            });
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
     }
 
     /// <inheritdoc />
@@ -309,6 +397,7 @@ public class LdapService : ILdapService
             }
         }
 
+        // Use milliseconds for timeout
         connection.ConnectionTimeout = _settings.ConnectionTimeout * 1000;
 
         return connection;
@@ -321,37 +410,19 @@ public class LdapService : ILdapService
         var bindDn = _settings.ServiceAccountUsername;
         if (!bindDn.Contains("@") && !bindDn.Contains(","))
         {
-            // If it's just a username, append the domain
             bindDn = $"{bindDn}@{_settings.Domain}";
         }
 
         connection.Bind(bindDn, _settings.ServiceAccountPassword);
     }
 
-    private string? FindUserDn(LdapConnection connection, string username)
+    private UserInfo? GetUserInfoFromConnection(LdapConnection connection, string username)
     {
         var filter = BuildUserFilter(username);
         var searchResults = connection.Search(
             _settings.BaseDN,
             LdapConnection.ScopeSub,
             filter,
-            new[] { "distinguishedName" },
-            false);
-
-        if (searchResults.HasMore())
-        {
-            return searchResults.Next().Dn;
-        }
-
-        return null;
-    }
-
-    private UserInfo? GetUserInfoFromDn(LdapConnection connection, string dn)
-    {
-        var searchResults = connection.Search(
-            dn,
-            LdapConnection.ScopeBase,
-            "(objectClass=*)",
             UserAttributes,
             false);
 
@@ -363,11 +434,19 @@ public class LdapService : ILdapService
         return null;
     }
 
+    private void CacheUserInfo(string username, UserInfo userInfo)
+    {
+        var cacheKey = $"{UserCachePrefix}{username.ToLowerInvariant()}";
+        var cacheOptions = new MemoryCacheEntryOptions()
+            .SetAbsoluteExpiration(TimeSpan.FromMinutes(_settings.CacheDurationMinutes))
+            .SetSize(1);
+
+        _cache.Set(cacheKey, userInfo, cacheOptions);
+    }
+
     private static string BuildUserFilter(string username)
     {
         var escapedUsername = EscapeLdapFilter(username);
-
-        // Search by sAMAccountName or userPrincipalName
         return $"(&(objectClass=user)(objectCategory=person)(|(sAMAccountName={escapedUsername})(userPrincipalName={escapedUsername})))";
     }
 
@@ -392,7 +471,6 @@ public class LdapService : ILdapService
             Company = GetAttributeValue(entry, "company")
         };
 
-        // Parse user account control flags
         var uacValue = GetAttributeValue(entry, "userAccountControl");
         if (int.TryParse(uacValue, out var uac))
         {
@@ -400,11 +478,9 @@ public class LdapService : ILdapService
             userInfo.IsEnabled = (uac & accountDisabled) == 0;
         }
 
-        // Check if account is locked
         var lockoutTime = GetAttributeValue(entry, "lockoutTime");
         userInfo.IsLocked = !string.IsNullOrEmpty(lockoutTime) && lockoutTime != "0";
 
-        // Parse groups
         var memberOf = entry.GetAttribute("memberOf");
         if (memberOf != null)
         {
@@ -418,7 +494,6 @@ public class LdapService : ILdapService
             }
         }
 
-        // Parse timestamps
         userInfo.WhenCreated = ParseLdapTimestamp(GetAttributeValue(entry, "whenCreated"));
         userInfo.WhenChanged = ParseLdapTimestamp(GetAttributeValue(entry, "whenChanged"));
         userInfo.LastLogon = ParseFileTime(GetAttributeValue(entry, "lastLogonTimestamp"));
@@ -441,12 +516,8 @@ public class LdapService : ILdapService
 
     private static string ExtractCnFromDn(string dn)
     {
-        if (string.IsNullOrEmpty(dn))
-        {
-            return string.Empty;
-        }
+        if (string.IsNullOrEmpty(dn)) return string.Empty;
 
-        // DN format: CN=GroupName,OU=Groups,DC=company,DC=com
         if (dn.StartsWith("CN=", StringComparison.OrdinalIgnoreCase))
         {
             var commaIndex = dn.IndexOf(',');
@@ -461,10 +532,7 @@ public class LdapService : ILdapService
 
     private static string EscapeLdapFilter(string input)
     {
-        if (string.IsNullOrEmpty(input))
-        {
-            return string.Empty;
-        }
+        if (string.IsNullOrEmpty(input)) return string.Empty;
 
         return input
             .Replace("\\", "\\5c")
@@ -476,13 +544,9 @@ public class LdapService : ILdapService
 
     private static DateTime? ParseLdapTimestamp(string timestamp)
     {
-        if (string.IsNullOrEmpty(timestamp))
-        {
-            return null;
-        }
+        if (string.IsNullOrEmpty(timestamp) || timestamp.Length < 14) return null;
 
-        // Format: yyyyMMddHHmmss.0Z
-        if (timestamp.Length >= 14)
+        try
         {
             var year = int.Parse(timestamp.Substring(0, 4));
             var month = int.Parse(timestamp.Substring(4, 2));
@@ -493,16 +557,15 @@ public class LdapService : ILdapService
 
             return new DateTime(year, month, day, hour, minute, second, DateTimeKind.Utc);
         }
-
-        return null;
+        catch
+        {
+            return null;
+        }
     }
 
     private static DateTime? ParseFileTime(string fileTimeString)
     {
-        if (string.IsNullOrEmpty(fileTimeString))
-        {
-            return null;
-        }
+        if (string.IsNullOrEmpty(fileTimeString)) return null;
 
         if (long.TryParse(fileTimeString, out var fileTime) && fileTime > 0)
         {

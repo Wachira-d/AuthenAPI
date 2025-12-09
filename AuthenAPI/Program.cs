@@ -11,6 +11,12 @@ builder.Services.Configure<LdapSettings>(builder.Configuration.GetSection("LdapS
 // Configure Audit settings
 builder.Services.Configure<AuditSettings>(builder.Configuration.GetSection("AuditSettings"));
 
+// Add Memory Cache for LDAP user caching
+builder.Services.AddMemoryCache(options =>
+{
+    options.SizeLimit = 1000; // Max 1000 cached items
+});
+
 // Register LDAP service
 builder.Services.AddScoped<ILdapService, LdapService>();
 

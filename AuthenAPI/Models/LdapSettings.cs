@@ -43,10 +43,25 @@ public class LdapSettings
     /// <summary>
     /// Connection timeout in seconds
     /// </summary>
-    public int ConnectionTimeout { get; set; } = 30;
+    public int ConnectionTimeout { get; set; } = 10;
 
     /// <summary>
     /// Skip SSL certificate validation (use only for development)
     /// </summary>
     public bool SkipCertificateValidation { get; set; } = false;
+
+    /// <summary>
+    /// Enable user info caching to reduce LDAP queries
+    /// </summary>
+    public bool EnableCache { get; set; } = true;
+
+    /// <summary>
+    /// Cache duration in minutes (default: 5 minutes)
+    /// </summary>
+    public int CacheDurationMinutes { get; set; } = 5;
+
+    /// <summary>
+    /// Maximum number of cached users (default: 1000)
+    /// </summary>
+    public int MaxCacheSize { get; set; } = 1000;
 }
