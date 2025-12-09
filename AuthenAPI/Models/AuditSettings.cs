@@ -34,4 +34,20 @@ public class AuditSettings
     /// Time window in minutes for failed login tracking
     /// </summary>
     public int FailedLoginWindowMinutes { get; set; } = 15;
+
+    /// <summary>
+    /// Enable automatic purging of old logs
+    /// </summary>
+    public bool AutoPurgeEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Interval in hours between auto-purge runs (default: 24 hours)
+    /// </summary>
+    public int AutoPurgeIntervalHours { get; set; } = 24;
+
+    /// <summary>
+    /// Time of day to run auto-purge (24-hour format, e.g., "02:00" for 2 AM)
+    /// If not set, purge runs at the interval from service start
+    /// </summary>
+    public string? AutoPurgeTime { get; set; }
 }

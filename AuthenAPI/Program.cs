@@ -17,6 +17,9 @@ builder.Services.AddScoped<ILdapService, LdapService>();
 // Register Audit service (singleton for in-memory storage)
 builder.Services.AddSingleton<IAuditService, AuditService>();
 
+// Register Audit Auto-Purge background service
+builder.Services.AddHostedService<AuditPurgeService>();
+
 builder.Services.AddControllers();
 // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
 builder.Services.AddEndpointsApiExplorer();
