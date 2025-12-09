@@ -104,7 +104,12 @@ public enum AuditAction
     /// <summary>
     /// View audit logs
     /// </summary>
-    ViewAuditLogs
+    ViewAuditLogs,
+
+    /// <summary>
+    /// API Key authentication attempt
+    /// </summary>
+    ApiKeyAuth
 }
 
 /// <summary>

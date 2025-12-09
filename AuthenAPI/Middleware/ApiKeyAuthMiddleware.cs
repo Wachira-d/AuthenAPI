@@ -47,7 +47,7 @@ public class ApiKeyAuthMiddleware
 
             await auditService.LogAsync(new AuditLog
             {
-                Action = "ApiKeyAuth",
+                Action = AuditAction.ApiKeyAuth,
                 Username = "Anonymous",
                 Success = false,
                 IpAddress = context.Connection.RemoteIpAddress?.ToString() ?? "Unknown",
@@ -77,7 +77,7 @@ public class ApiKeyAuthMiddleware
 
             await auditService.LogAsync(new AuditLog
             {
-                Action = "ApiKeyAuth",
+                Action = AuditAction.ApiKeyAuth,
                 Username = "Anonymous",
                 Success = false,
                 IpAddress = context.Connection.RemoteIpAddress?.ToString() ?? "Unknown",
@@ -98,7 +98,7 @@ public class ApiKeyAuthMiddleware
 
             await auditService.LogAsync(new AuditLog
             {
-                Action = "ApiKeyAuth",
+                Action = AuditAction.ApiKeyAuth,
                 Username = keyConfig.Description,
                 Success = false,
                 IpAddress = context.Connection.RemoteIpAddress?.ToString() ?? "Unknown",
