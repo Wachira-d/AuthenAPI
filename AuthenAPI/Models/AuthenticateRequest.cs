@@ -8,7 +8,8 @@ namespace AuthenAPI.Models;
 public class AuthenticateRequest
 {
     /// <summary>
-    /// Username (sAMAccountName or userPrincipalName)
+    /// Username (sAMAccountName, userPrincipalName, or email address)
+    /// Examples: "john.doe", "john.doe@domain.com", "john.doe@company.com"
     /// </summary>
     [Required(ErrorMessage = "Username is required")]
     [StringLength(256, MinimumLength = 1, ErrorMessage = "Username must be between 1 and 256 characters")]

@@ -87,10 +87,48 @@ public class LdapService : ILdapService
             {
                 try
                 {
-                    // Build user principal name for direct bind
-                    var userPrincipal = username.Contains("@") ? username : $"{username}@{_settings.Domain}";
+                    string userPrincipal;
+                    string searchIdentifier = username;
 
-                    // Try direct bind first (faster - single connection)
+                    // Check if input looks like an email (contains @ but not in domain format)
+                    if (username.Contains("@"))
+                    {
+                        // Check if it's already in UPN format (user@domain)
+                        var domainPart = username.Split('@')[1];
+                        if (domainPart.Equals(_settings.Domain, StringComparison.OrdinalIgnoreCase))
+                        {
+                            // It's a UPN, use directly
+                            userPrincipal = username;
+                        }
+                        else
+                        {
+                            // It might be an email, search for the user first
+                            _logger.LogDebug("Input appears to be email, searching for user: {Email}", username);
+
+                            using var searchConnection = CreateConnection();
+                            searchConnection.Connect(_settings.Server, _settings.Port);
+                            ConnectAndBind(searchConnection);
+
+                            var userInfo = GetUserInfoFromConnection(searchConnection, username);
+                            if (userInfo == null)
+                            {
+                                _logger.LogWarning("User not found with email: {Email}", username);
+                                return null;
+                            }
+
+                            // Use the found userPrincipalName for authentication
+                            userPrincipal = userInfo.UserPrincipalName ?? $"{userInfo.SamAccountName}@{_settings.Domain}";
+                            searchIdentifier = userInfo.SamAccountName ?? username;
+                            _logger.LogDebug("Found user {SamAccountName} for email {Email}", userInfo.SamAccountName, username);
+                        }
+                    }
+                    else
+                    {
+                        // Plain username, append domain
+                        userPrincipal = $"{username}@{_settings.Domain}";
+                    }
+
+                    // Now authenticate with the resolved userPrincipal
                     using var connection = CreateConnection();
                     try
                     {
@@ -100,15 +138,21 @@ public class LdapService : ILdapService
                         if (connection.Bound)
                         {
                             _logger.LogInformation("User authenticated successfully: {Username} in {Ms}ms",
-                                username, stopwatch.ElapsedMilliseconds);
+                                searchIdentifier, stopwatch.ElapsedMilliseconds);
 
                             // Get user info using the authenticated connection
-                            var userInfo = GetUserInfoFromConnection(connection, username);
+                            var userInfo = GetUserInfoFromConnection(connection, searchIdentifier);
 
                             // Cache the user info
                             if (userInfo != null && _settings.EnableCache)
                             {
-                                CacheUserInfo(username, userInfo);
+                                CacheUserInfo(searchIdentifier, userInfo);
+                                // Also cache by email if different
+                                if (!string.IsNullOrEmpty(userInfo.Email) &&
+                                    !userInfo.Email.Equals(searchIdentifier, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    CacheUserInfo(userInfo.Email, userInfo);
+                                }
                             }
 
                             return userInfo;
@@ -116,7 +160,7 @@ public class LdapService : ILdapService
                     }
                     catch (LdapException ex) when (ex.ResultCode == LdapException.InvalidCredentials)
                     {
-                        _logger.LogWarning("Invalid credentials for user: {Username}", username);
+                        _logger.LogWarning("Invalid credentials for user: {Username}", searchIdentifier);
                         return null;
                     }
 
@@ -456,7 +500,8 @@ public class LdapService : ILdapService
     private static string BuildUserFilter(string username)
     {
         var escapedUsername = EscapeLdapFilter(username);
-        return $"(&(objectClass=user)(objectCategory=person)(|(sAMAccountName={escapedUsername})(userPrincipalName={escapedUsername})))";
+        // Search by sAMAccountName, userPrincipalName, or mail (email)
+        return $"(&(objectClass=user)(objectCategory=person)(|(sAMAccountName={escapedUsername})(userPrincipalName={escapedUsername})(mail={escapedUsername})))";
     }
 
     private static UserInfo MapEntryToUserInfo(LdapEntry entry)
