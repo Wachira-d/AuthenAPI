@@ -1,6 +1,7 @@
 using AuthenAPI.Models;
 using AuthenAPI.Services;
 using Microsoft.AspNetCore.Mvc;
+using System.Diagnostics;
 
 namespace AuthenAPI.Controllers;
 
@@ -13,11 +14,16 @@ namespace AuthenAPI.Controllers;
 public class LdapController : ControllerBase
 {
     private readonly ILdapService _ldapService;
+    private readonly IAuditService _auditService;
     private readonly ILogger<LdapController> _logger;
 
-    public LdapController(ILdapService ldapService, ILogger<LdapController> logger)
+    public LdapController(
+        ILdapService ldapService,
+        IAuditService auditService,
+        ILogger<LdapController> logger)
     {
         _ldapService = ldapService;
+        _auditService = auditService;
         _logger = logger;
     }
 
@@ -30,9 +36,24 @@ public class LdapController : ControllerBase
     [ProducesResponseType(typeof(ApiResponse), StatusCodes.Status503ServiceUnavailable)]
     public async Task<IActionResult> TestConnection()
     {
+        var stopwatch = Stopwatch.StartNew();
         _logger.LogInformation("Testing LDAP connection");
 
         var isConnected = await _ldapService.TestConnectionAsync();
+        stopwatch.Stop();
+
+        await _auditService.LogAsync(new AuditLog
+        {
+            Action = AuditAction.TestConnection,
+            Success = isConnected,
+            IpAddress = GetClientIpAddress(),
+            UserAgent = GetUserAgent(),
+            RequestPath = Request.Path,
+            HttpMethod = Request.Method,
+            DurationMs = stopwatch.ElapsedMilliseconds,
+            StatusCode = isConnected ? 200 : 503,
+            Details = isConnected ? "Connection successful" : "Connection failed"
+        });
 
         if (isConnected)
         {
@@ -54,8 +75,25 @@ public class LdapController : ControllerBase
     [ProducesResponseType(typeof(ApiResponse), StatusCodes.Status400BadRequest)]
     public async Task<IActionResult> Authenticate([FromBody] AuthenticateRequest request)
     {
+        var stopwatch = Stopwatch.StartNew();
+
         if (!ModelState.IsValid)
         {
+            stopwatch.Stop();
+            await _auditService.LogAsync(new AuditLog
+            {
+                Action = AuditAction.Authenticate,
+                Username = request.Username,
+                Success = false,
+                IpAddress = GetClientIpAddress(),
+                UserAgent = GetUserAgent(),
+                RequestPath = Request.Path,
+                HttpMethod = Request.Method,
+                DurationMs = stopwatch.ElapsedMilliseconds,
+                StatusCode = 400,
+                Details = "Invalid request: " + string.Join("; ", ModelState.Values.SelectMany(v => v.Errors.Select(e => e.ErrorMessage)))
+            });
+
             return BadRequest(ApiResponse.Fail("Invalid request",
                 string.Join("; ", ModelState.Values.SelectMany(v => v.Errors.Select(e => e.ErrorMessage)))));
         }
@@ -63,14 +101,49 @@ public class LdapController : ControllerBase
         _logger.LogInformation("Authentication attempt for user: {Username}", request.Username);
 
         var userInfo = await _ldapService.AuthenticateAsync(request.Username, request.Password);
+        stopwatch.Stop();
 
         if (userInfo != null)
         {
             _logger.LogInformation("User authenticated successfully: {Username}", request.Username);
+
+            await _auditService.LogAsync(new AuditLog
+            {
+                Action = AuditAction.Authenticate,
+                Username = request.Username,
+                Success = true,
+                IpAddress = GetClientIpAddress(),
+                UserAgent = GetUserAgent(),
+                RequestPath = Request.Path,
+                HttpMethod = Request.Method,
+                DurationMs = stopwatch.ElapsedMilliseconds,
+                StatusCode = 200,
+                Details = $"User authenticated. Groups: {userInfo.Groups.Count}"
+            });
+
             return Ok(ApiResponse<UserInfo>.Ok(userInfo, "Authentication successful"));
         }
 
         _logger.LogWarning("Authentication failed for user: {Username}", request.Username);
+
+        // Check for brute force attempts
+        var failedAttempts = await _auditService.GetRecentFailedLoginCountAsync(request.Username);
+        var details = $"Invalid credentials. Failed attempts in last 15 min: {failedAttempts + 1}";
+
+        await _auditService.LogAsync(new AuditLog
+        {
+            Action = AuditAction.Authenticate,
+            Username = request.Username,
+            Success = false,
+            IpAddress = GetClientIpAddress(),
+            UserAgent = GetUserAgent(),
+            RequestPath = Request.Path,
+            HttpMethod = Request.Method,
+            DurationMs = stopwatch.ElapsedMilliseconds,
+            StatusCode = 401,
+            Details = details
+        });
+
         return Unauthorized(ApiResponse.Fail("Authentication failed. Invalid username or password."));
     }
 
@@ -84,6 +157,8 @@ public class LdapController : ControllerBase
     [ProducesResponseType(typeof(ApiResponse), StatusCodes.Status404NotFound)]
     public async Task<IActionResult> GetUser(string username)
     {
+        var stopwatch = Stopwatch.StartNew();
+
         if (string.IsNullOrWhiteSpace(username))
         {
             return BadRequest(ApiResponse.Fail("Username is required"));
@@ -92,10 +167,27 @@ public class LdapController : ControllerBase
         _logger.LogInformation("Getting user info for: {Username}", username);
 
         var userInfo = await _ldapService.GetUserAsync(username);
+        stopwatch.Stop();
 
-        if (userInfo != null)
+        var success = userInfo != null;
+
+        await _auditService.LogAsync(new AuditLog
         {
-            return Ok(ApiResponse<UserInfo>.Ok(userInfo));
+            Action = AuditAction.GetUser,
+            Username = username,
+            Success = success,
+            IpAddress = GetClientIpAddress(),
+            UserAgent = GetUserAgent(),
+            RequestPath = Request.Path,
+            HttpMethod = Request.Method,
+            DurationMs = stopwatch.ElapsedMilliseconds,
+            StatusCode = success ? 200 : 404,
+            Details = success ? "User found" : "User not found"
+        });
+
+        if (success)
+        {
+            return Ok(ApiResponse<UserInfo>.Ok(userInfo!));
         }
 
         return NotFound(ApiResponse.Fail($"User '{username}' not found"));
@@ -110,9 +202,25 @@ public class LdapController : ControllerBase
     [ProducesResponseType(typeof(ApiResponse<List<UserInfo>>), StatusCodes.Status200OK)]
     public async Task<IActionResult> SearchUsers([FromBody] SearchRequest request)
     {
+        var stopwatch = Stopwatch.StartNew();
+
         _logger.LogInformation("Searching users with query: {Query}", request.Query);
 
         var users = await _ldapService.SearchUsersAsync(request);
+        stopwatch.Stop();
+
+        await _auditService.LogAsync(new AuditLog
+        {
+            Action = AuditAction.SearchUsers,
+            Success = true,
+            IpAddress = GetClientIpAddress(),
+            UserAgent = GetUserAgent(),
+            RequestPath = Request.Path,
+            HttpMethod = Request.Method,
+            DurationMs = stopwatch.ElapsedMilliseconds,
+            StatusCode = 200,
+            Details = $"Query: '{request.Query}', Results: {users.Count}"
+        });
 
         return Ok(ApiResponse<List<UserInfo>>.Ok(users, $"Found {users.Count} user(s)"));
     }
@@ -129,6 +237,8 @@ public class LdapController : ControllerBase
         [FromQuery] string? q = null,
         [FromQuery] int maxResults = 100)
     {
+        var stopwatch = Stopwatch.StartNew();
+
         var request = new SearchRequest
         {
             Query = q,
@@ -138,6 +248,20 @@ public class LdapController : ControllerBase
         _logger.LogInformation("Searching users with query: {Query}", q);
 
         var users = await _ldapService.SearchUsersAsync(request);
+        stopwatch.Stop();
+
+        await _auditService.LogAsync(new AuditLog
+        {
+            Action = AuditAction.SearchUsers,
+            Success = true,
+            IpAddress = GetClientIpAddress(),
+            UserAgent = GetUserAgent(),
+            RequestPath = Request.Path,
+            HttpMethod = Request.Method,
+            DurationMs = stopwatch.ElapsedMilliseconds,
+            StatusCode = 200,
+            Details = $"Query: '{q}', Results: {users.Count}"
+        });
 
         return Ok(ApiResponse<List<UserInfo>>.Ok(users, $"Found {users.Count} user(s)"));
     }
@@ -152,6 +276,8 @@ public class LdapController : ControllerBase
     [ProducesResponseType(typeof(ApiResponse), StatusCodes.Status404NotFound)]
     public async Task<IActionResult> GetUserGroups(string username)
     {
+        var stopwatch = Stopwatch.StartNew();
+
         if (string.IsNullOrWhiteSpace(username))
         {
             return BadRequest(ApiResponse.Fail("Username is required"));
@@ -163,10 +289,40 @@ public class LdapController : ControllerBase
         var userInfo = await _ldapService.GetUserAsync(username);
         if (userInfo == null)
         {
+            stopwatch.Stop();
+            await _auditService.LogAsync(new AuditLog
+            {
+                Action = AuditAction.GetUserGroups,
+                Username = username,
+                Success = false,
+                IpAddress = GetClientIpAddress(),
+                UserAgent = GetUserAgent(),
+                RequestPath = Request.Path,
+                HttpMethod = Request.Method,
+                DurationMs = stopwatch.ElapsedMilliseconds,
+                StatusCode = 404,
+                Details = "User not found"
+            });
+
             return NotFound(ApiResponse.Fail($"User '{username}' not found"));
         }
 
         var groups = await _ldapService.GetUserGroupsAsync(username);
+        stopwatch.Stop();
+
+        await _auditService.LogAsync(new AuditLog
+        {
+            Action = AuditAction.GetUserGroups,
+            Username = username,
+            Success = true,
+            IpAddress = GetClientIpAddress(),
+            UserAgent = GetUserAgent(),
+            RequestPath = Request.Path,
+            HttpMethod = Request.Method,
+            DurationMs = stopwatch.ElapsedMilliseconds,
+            StatusCode = 200,
+            Details = $"Groups found: {groups.Count}"
+        });
 
         return Ok(ApiResponse<List<string>>.Ok(groups, $"User belongs to {groups.Count} group(s)"));
     }
@@ -182,6 +338,8 @@ public class LdapController : ControllerBase
     [ProducesResponseType(typeof(ApiResponse), StatusCodes.Status404NotFound)]
     public async Task<IActionResult> CheckGroupMembership(string username, string groupName)
     {
+        var stopwatch = Stopwatch.StartNew();
+
         if (string.IsNullOrWhiteSpace(username))
         {
             return BadRequest(ApiResponse.Fail("Username is required"));
@@ -198,15 +356,66 @@ public class LdapController : ControllerBase
         var userInfo = await _ldapService.GetUserAsync(username);
         if (userInfo == null)
         {
+            stopwatch.Stop();
+            await _auditService.LogAsync(new AuditLog
+            {
+                Action = AuditAction.CheckGroupMembership,
+                Username = username,
+                Success = false,
+                IpAddress = GetClientIpAddress(),
+                UserAgent = GetUserAgent(),
+                RequestPath = Request.Path,
+                HttpMethod = Request.Method,
+                DurationMs = stopwatch.ElapsedMilliseconds,
+                StatusCode = 404,
+                Details = $"User not found. Checking group: {groupName}"
+            });
+
             return NotFound(ApiResponse.Fail($"User '{username}' not found"));
         }
 
         var isMember = await _ldapService.IsUserInGroupAsync(username, groupName);
+        stopwatch.Stop();
 
         var message = isMember
             ? $"User '{username}' is a member of group '{groupName}'"
             : $"User '{username}' is NOT a member of group '{groupName}'";
 
+        await _auditService.LogAsync(new AuditLog
+        {
+            Action = AuditAction.CheckGroupMembership,
+            Username = username,
+            Success = true,
+            IpAddress = GetClientIpAddress(),
+            UserAgent = GetUserAgent(),
+            RequestPath = Request.Path,
+            HttpMethod = Request.Method,
+            DurationMs = stopwatch.ElapsedMilliseconds,
+            StatusCode = 200,
+            Details = $"Group: {groupName}, IsMember: {isMember}"
+        });
+
         return Ok(ApiResponse<bool>.Ok(isMember, message));
     }
+
+    #region Private Helper Methods
+
+    private string? GetClientIpAddress()
+    {
+        // Check for forwarded IP (behind proxy/load balancer)
+        var forwardedFor = Request.Headers["X-Forwarded-For"].FirstOrDefault();
+        if (!string.IsNullOrEmpty(forwardedFor))
+        {
+            return forwardedFor.Split(',').FirstOrDefault()?.Trim();
+        }
+
+        return HttpContext.Connection.RemoteIpAddress?.ToString();
+    }
+
+    private string? GetUserAgent()
+    {
+        return Request.Headers["User-Agent"].FirstOrDefault();
+    }
+
+    #endregion
 }

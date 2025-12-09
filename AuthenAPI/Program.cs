@@ -8,8 +8,14 @@ var builder = WebApplication.CreateBuilder(args);
 // Configure LDAP settings
 builder.Services.Configure<LdapSettings>(builder.Configuration.GetSection("LdapSettings"));
 
+// Configure Audit settings
+builder.Services.Configure<AuditSettings>(builder.Configuration.GetSection("AuditSettings"));
+
 // Register LDAP service
 builder.Services.AddScoped<ILdapService, LdapService>();
+
+// Register Audit service (singleton for in-memory storage)
+builder.Services.AddSingleton<IAuditService, AuditService>();
 
 builder.Services.AddControllers();
 // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
