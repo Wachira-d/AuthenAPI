@@ -670,6 +670,7 @@ public class LdapService : ILdapService
         var portConfigs = new[]
         {
             (Port: 636, UseSSL: true, Name: "LDAPS-636"),
+            (Port: 636, UseSSL: false, Name: "LDAP-636-NoSSL"),
             (Port: 389, UseSSL: false, Name: "LDAP-389"),
             (Port: 3269, UseSSL: true, Name: "GC-SSL-3269"),
             (Port: 3268, UseSSL: false, Name: "GC-3268")
