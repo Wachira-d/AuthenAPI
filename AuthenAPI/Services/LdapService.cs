@@ -66,6 +66,10 @@ public class LdapService : ILdapService
                 {
                     _logger.LogInformation("=== Starting Authentication for: {Username} ===", username);
 
+                    // Detect input format
+                    var inputFormat = DetectUsernameFormat(username);
+                    _logger.LogInformation("Input format detected: {Format}", inputFormat);
+
                     // Step 1: Authenticate user credentials using combined fallback approach
                     _logger.LogDebug("Step 1: Authenticating user credentials (with fallback methods)...");
                     var (authSuccess, authMethod, usernameUsed) = AuthenticateWithFallback(username, password);
@@ -85,16 +89,9 @@ public class LdapService : ILdapService
                         _settings.ServiceAccountUsername,
                         _settings.ServiceAccountPassword);
 
-                    string searchIdentifier = usernameUsed ?? username;
-                    // Extract SAM from email/UPN format for search
-                    if (searchIdentifier.Contains("@"))
-                    {
-                        searchIdentifier = searchIdentifier.Split('@')[0];
-                    }
-                    if (searchIdentifier.Contains("\\"))
-                    {
-                        searchIdentifier = searchIdentifier.Split('\\')[1];
-                    }
+                    // Extract SAM from the username used for search
+                    string searchIdentifier = ExtractSamAccountName(usernameUsed ?? username);
+                    _logger.LogDebug("Search identifier (SAM): {SAM}", searchIdentifier);
 
                     if (svcResult.Success && svcResult.Connection != null)
                     {
@@ -817,8 +814,76 @@ public class LdapService : ILdapService
 
     private static string BuildUserFilter(string username)
     {
-        var escaped = EscapeLdapFilter(username);
-        return $"(&(objectClass=user)(objectCategory=person)(|(sAMAccountName={escaped})(userPrincipalName={escaped})(mail={escaped})))";
+        // Parse username to extract clean SAM account name
+        var cleanUsername = ExtractSamAccountName(username);
+        var escaped = EscapeLdapFilter(cleanUsername);
+        var originalEscaped = EscapeLdapFilter(username);
+
+        // Build filter that searches by:
+        // - sAMAccountName (Pre-Windows 2000 logon name)
+        // - userPrincipalName (UPN - user@domain.com)
+        // - mail (email address)
+        return $"(&(objectClass=user)(objectCategory=person)(|(sAMAccountName={escaped})(userPrincipalName={originalEscaped})(mail={originalEscaped})))";
+    }
+
+    /// <summary>
+    /// Extract SAM account name from various input formats
+    /// Supports: email@domain.com, DOMAIN\username, username
+    /// </summary>
+    private static string ExtractSamAccountName(string input)
+    {
+        if (string.IsNullOrEmpty(input)) return input;
+
+        // Pre-Windows 2000 format: DOMAIN\username
+        if (input.Contains("\\"))
+        {
+            return input.Split('\\').Last();
+        }
+
+        // Email/UPN format: user@domain.com
+        if (input.Contains("@"))
+        {
+            return input.Split('@').First();
+        }
+
+        // Already SAM format
+        return input;
+    }
+
+    /// <summary>
+    /// Detect the format of the username input
+    /// </summary>
+    private static string DetectUsernameFormat(string input)
+    {
+        if (string.IsNullOrEmpty(input)) return "Empty";
+
+        // Pre-Windows 2000 format: DOMAIN\username
+        if (input.Contains("\\"))
+        {
+            var parts = input.Split('\\');
+            return $"Pre-Windows 2000 (NetBIOS): Domain={parts[0]}, User={parts[1]}";
+        }
+
+        // Email/UPN format
+        if (input.Contains("@"))
+        {
+            var parts = input.Split('@');
+            var domain = parts[1].ToLowerInvariant();
+
+            if (domain.Contains("."))
+            {
+                // Full domain like user@domain.company.com
+                return $"UPN/Email: User={parts[0]}, Domain={domain}";
+            }
+            else
+            {
+                // Short domain like user@DOMAIN
+                return $"UPN (Short): User={parts[0]}, Domain={domain}";
+            }
+        }
+
+        // Plain SAM account name
+        return $"SAM Account Name: {input}";
     }
 
     private static UserInfo MapEntryToUserInfo(SearchResultEntry entry)
@@ -989,31 +1054,63 @@ public class LdapService : ILdapService
 
     /// <summary>
     /// Get multiple username formats to try for authentication
+    /// Supports: email@domain.com, DOMAIN\username, username (Pre-Windows 2000)
     /// </summary>
     private string[] GetUsernameFormats(string username)
     {
         var formats = new List<string>();
+        var domainShort = _settings.Domain.Split('.').FirstOrDefault()?.ToUpperInvariant() ?? "IPSOSGROUP";
 
         // Original format
         formats.Add(username);
 
-        if (username.Contains("@"))
+        // Parse to get clean SAM account name
+        string sam;
+        string? emailDomain = null;
+
+        if (username.Contains("\\"))
         {
-            // Extract SAM from email/UPN
-            var sam = username.Split('@')[0];
-            formats.Add(sam);
-            formats.Add($"{sam}@{_settings.Domain}");
-            formats.Add($"IPSOSGROUP\\{sam}");
+            // Pre-Windows 2000 format: DOMAIN\username
+            var parts = username.Split('\\');
+            sam = parts.Last();
+            _logger.LogDebug("Detected Pre-2000 format. Extracted SAM: {SAM}", sam);
+        }
+        else if (username.Contains("@"))
+        {
+            // Email/UPN format: user@domain.com
+            var parts = username.Split('@');
+            sam = parts.First();
+            emailDomain = parts.Last();
+            _logger.LogDebug("Detected email/UPN format. Extracted SAM: {SAM}, Domain: {Domain}", sam, emailDomain);
         }
         else
         {
-            // Add UPN and NetBIOS formats
-            formats.Add($"{username}@{_settings.Domain}");
-            formats.Add($"{username}@ipsos.com");
-            formats.Add($"IPSOSGROUP\\{username}");
+            // Already SAM format
+            sam = username;
+            _logger.LogDebug("Detected SAM format: {SAM}", sam);
         }
 
-        return formats.Distinct().ToArray();
+        // Add all possible formats
+        formats.Add(sam);  // Just SAM
+
+        // UPN formats
+        formats.Add($"{sam}@{_settings.Domain}");  // SAM@full.domain.com
+        formats.Add($"{sam}@ipsos.com");           // SAM@ipsos.com
+
+        // Pre-Windows 2000 (NetBIOS) formats
+        formats.Add($"{domainShort}\\{sam}");      // DOMAIN\SAM
+        formats.Add($"IPSOSGROUP\\{sam}");         // IPSOSGROUP\SAM (hardcoded)
+
+        // If original was email, also try with original domain
+        if (!string.IsNullOrEmpty(emailDomain) && !emailDomain.Equals("ipsos.com", StringComparison.OrdinalIgnoreCase))
+        {
+            formats.Add($"{sam}@{emailDomain}");
+        }
+
+        var result = formats.Distinct().ToArray();
+        _logger.LogDebug("Username formats to try: {Formats}", string.Join(", ", result));
+
+        return result;
     }
 
     /// <summary>
