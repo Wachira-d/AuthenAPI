@@ -63,62 +63,110 @@ public class LdapService : ILdapService
             {
                 try
                 {
-                    string userPrincipal;
-                    string searchIdentifier = username;
+                    _logger.LogInformation("=== Starting Authentication for: {Username} ===", username);
 
-                    // Check if input looks like an email
-                    if (username.Contains("@"))
+                    // Step 1: Try to connect with service account using multi-strategy
+                    _logger.LogDebug("Step 1: Establishing service connection...");
+                    var svcResult = TryMultipleConnectionStrategies(
+                        _settings.ServiceAccountUsername,
+                        _settings.ServiceAccountPassword);
+
+                    if (!svcResult.Success || svcResult.Connection == null)
                     {
-                        var domainPart = username.Split('@')[1];
-                        if (domainPart.Equals(_settings.Domain, StringComparison.OrdinalIgnoreCase))
-                        {
-                            userPrincipal = username;
-                        }
-                        else
-                        {
-                            // Email login - search for user by email first
-                            _logger.LogDebug("Input appears to be email, searching for user: {Email}", username);
+                        _logger.LogError("Failed to establish service connection. Cannot authenticate user.");
+                        _logger.LogError("Service account connection errors: {Errors}", svcResult.ErrorMessage);
+                        return null;
+                    }
 
-                            using var searchConn = CreateServiceConnection();
-                            var userInfo = SearchUser(searchConn, username);
-                            if (userInfo == null)
+                    _logger.LogInformation("Service connection established using strategy: {Strategy}",
+                        svcResult.StrategyName);
+
+                    // Step 2: Search for user to get their info
+                    string searchIdentifier = username;
+                    string? userPrincipalName = null;
+
+                    using (svcResult.Connection)
+                    {
+                        _logger.LogDebug("Step 2: Searching for user: {Username}", username);
+                        var userInfo = SearchUser(svcResult.Connection, username);
+
+                        if (userInfo == null)
+                        {
+                            _logger.LogWarning("User not found: {Username}", username);
+                            return null;
+                        }
+
+                        userPrincipalName = userInfo.UserPrincipalName;
+                        searchIdentifier = userInfo.SamAccountName ?? username;
+                        _logger.LogInformation("User found: {DisplayName} ({SAM})",
+                            userInfo.DisplayName, userInfo.SamAccountName);
+                    }
+
+                    // Step 3: Authenticate user with their credentials using multi-strategy
+                    _logger.LogDebug("Step 3: Authenticating user credentials...");
+                    var authResult = TryMultipleConnectionStrategies(username, password);
+
+                    if (!authResult.Success)
+                    {
+                        // Try with UPN if different from input
+                        if (!string.IsNullOrEmpty(userPrincipalName) &&
+                            !userPrincipalName.Equals(username, StringComparison.OrdinalIgnoreCase))
+                        {
+                            _logger.LogDebug("Retrying authentication with UPN: {UPN}", userPrincipalName);
+                            authResult = TryMultipleConnectionStrategies(userPrincipalName, password);
+                        }
+
+                        // Try with SAM account name
+                        if (!authResult.Success && !searchIdentifier.Equals(username, StringComparison.OrdinalIgnoreCase))
+                        {
+                            _logger.LogDebug("Retrying authentication with SAM: {SAM}", searchIdentifier);
+                            authResult = TryMultipleConnectionStrategies(searchIdentifier, password);
+                        }
+                    }
+
+                    if (!authResult.Success)
+                    {
+                        _logger.LogWarning("Authentication failed for user: {Username}", username);
+                        _logger.LogDebug("Auth errors: {Errors}", authResult.ErrorMessage);
+                        return null;
+                    }
+
+                    _logger.LogInformation("✓ User authenticated successfully: {Username} using strategy: {Strategy}",
+                        username, authResult.StrategyName);
+
+                    // Dispose auth connection - we just needed to verify credentials
+                    authResult.Connection?.Dispose();
+
+                    // Step 4: Get full user info with service account
+                    _logger.LogDebug("Step 4: Fetching user details...");
+                    var svcResult2 = TryMultipleConnectionStrategies(
+                        _settings.ServiceAccountUsername,
+                        _settings.ServiceAccountPassword);
+
+                    if (svcResult2.Success && svcResult2.Connection != null)
+                    {
+                        using (svcResult2.Connection)
+                        {
+                            var result = SearchUser(svcResult2.Connection, searchIdentifier);
+
+                            if (result != null && _settings.EnableCache)
                             {
-                                _logger.LogWarning("User not found with email: {Email}", username);
-                                return null;
+                                CacheUserInfo(searchIdentifier, result);
+                                if (!string.IsNullOrEmpty(result.Email) &&
+                                    !result.Email.Equals(searchIdentifier, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    CacheUserInfo(result.Email, result);
+                                }
                             }
 
-                            userPrincipal = userInfo.UserPrincipalName ?? $"{userInfo.SamAccountName}@{_settings.Domain}";
-                            searchIdentifier = userInfo.SamAccountName ?? username;
-                            _logger.LogDebug("Found user {SamAccountName} for email {Email}", userInfo.SamAccountName, username);
-                        }
-                    }
-                    else
-                    {
-                        userPrincipal = $"{username}@{_settings.Domain}";
-                    }
-
-                    // Authenticate by binding with user credentials
-                    using var connection = CreateConnection(userPrincipal, password);
-
-                    // If we get here, bind succeeded - user is authenticated
-                    _logger.LogInformation("User authenticated successfully: {Username} in {Ms}ms",
-                        searchIdentifier, stopwatch.ElapsedMilliseconds);
-
-                    // Search for user info using service account
-                    using var svcConn = CreateServiceConnection();
-                    var result = SearchUser(svcConn, searchIdentifier);
-
-                    if (result != null && _settings.EnableCache)
-                    {
-                        CacheUserInfo(searchIdentifier, result);
-                        if (!string.IsNullOrEmpty(result.Email) &&
-                            !result.Email.Equals(searchIdentifier, StringComparison.OrdinalIgnoreCase))
-                        {
-                            CacheUserInfo(result.Email, result);
+                            _logger.LogInformation("=== Authentication completed successfully for: {Username} in {Ms}ms ===",
+                                username, stopwatch.ElapsedMilliseconds);
+                            return result;
                         }
                     }
 
-                    return result;
+                    _logger.LogWarning("Could not fetch user details after authentication");
+                    return null;
                 }
                 catch (LdapException ex) when (ex.ErrorCode == 49)
                 {
@@ -340,15 +388,27 @@ public class LdapService : ILdapService
             {
                 try
                 {
-                    using var connection = CreateServiceConnection();
-                    var userInfo = SearchUser(connection, username);
+                    var connResult = TryMultipleConnectionStrategies(
+                        _settings.ServiceAccountUsername,
+                        _settings.ServiceAccountPassword);
 
-                    if (userInfo != null && _settings.EnableCache)
+                    if (!connResult.Success || connResult.Connection == null)
                     {
-                        CacheUserInfo(username, userInfo);
+                        _logger.LogError("Failed to connect for GetUser: {Errors}", connResult.ErrorMessage);
+                        return null;
                     }
 
-                    return userInfo;
+                    using (connResult.Connection)
+                    {
+                        var userInfo = SearchUser(connResult.Connection, username);
+
+                        if (userInfo != null && _settings.EnableCache)
+                        {
+                            CacheUserInfo(username, userInfo);
+                        }
+
+                        return userInfo;
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -376,36 +436,47 @@ public class LdapService : ILdapService
 
                 try
                 {
-                    using var connection = CreateServiceConnection();
+                    var connResult = TryMultipleConnectionStrategies(
+                        _settings.ServiceAccountUsername,
+                        _settings.ServiceAccountPassword);
 
-                    string filter;
-                    if (!string.IsNullOrEmpty(request.Query))
+                    if (!connResult.Success || connResult.Connection == null)
                     {
-                        var escaped = EscapeLdapFilter(request.Query);
-                        filter = $"(&(objectClass=user)(objectCategory=person)(|(displayName=*{escaped}*)(sAMAccountName=*{escaped}*)(mail=*{escaped}*)(givenName=*{escaped}*)(sn=*{escaped}*)))";
-                    }
-                    else
-                    {
-                        filter = "(&(objectClass=user)(objectCategory=person))";
+                        _logger.LogError("Failed to connect for SearchUsers: {Errors}", connResult.ErrorMessage);
+                        return users;
                     }
 
-                    var searchRequest = new System.DirectoryServices.Protocols.SearchRequest(
-                        _settings.BaseDN,
-                        filter,
-                        SearchScope.Subtree,
-                        AuthAttributes);
-                    searchRequest.SizeLimit = request.MaxResults;
-                    searchRequest.TimeLimit = TimeSpan.FromSeconds(_settings.ConnectionTimeout);
-
-                    var response = (SearchResponse)connection.SendRequest(searchRequest);
-
-                    foreach (SearchResultEntry entry in response.Entries)
+                    using (connResult.Connection)
                     {
-                        users.Add(MapEntryToUserInfo(entry));
-                        if (users.Count >= request.MaxResults) break;
-                    }
+                        string filter;
+                        if (!string.IsNullOrEmpty(request.Query))
+                        {
+                            var escaped = EscapeLdapFilter(request.Query);
+                            filter = $"(&(objectClass=user)(objectCategory=person)(|(displayName=*{escaped}*)(sAMAccountName=*{escaped}*)(mail=*{escaped}*)(givenName=*{escaped}*)(sn=*{escaped}*)))";
+                        }
+                        else
+                        {
+                            filter = "(&(objectClass=user)(objectCategory=person))";
+                        }
 
-                    _logger.LogInformation("Search returned {Count} users", users.Count);
+                        var searchRequest = new System.DirectoryServices.Protocols.SearchRequest(
+                            _settings.BaseDN,
+                            filter,
+                            SearchScope.Subtree,
+                            AuthAttributes);
+                        searchRequest.SizeLimit = request.MaxResults;
+                        searchRequest.TimeLimit = TimeSpan.FromSeconds(_settings.ConnectionTimeout);
+
+                        var response = (SearchResponse)connResult.Connection.SendRequest(searchRequest);
+
+                        foreach (SearchResultEntry entry in response.Entries)
+                        {
+                            users.Add(MapEntryToUserInfo(entry));
+                            if (users.Count >= request.MaxResults) break;
+                        }
+
+                        _logger.LogInformation("Search returned {Count} users", users.Count);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -443,37 +514,48 @@ public class LdapService : ILdapService
 
                 try
                 {
-                    using var connection = CreateServiceConnection();
+                    var connResult = TryMultipleConnectionStrategies(
+                        _settings.ServiceAccountUsername,
+                        _settings.ServiceAccountPassword);
 
-                    var filter = BuildUserFilter(username);
-                    var searchRequest = new System.DirectoryServices.Protocols.SearchRequest(
-                        _settings.BaseDN,
-                        filter,
-                        SearchScope.Subtree,
-                        new[] { "memberOf" });
-
-                    var response = (SearchResponse)connection.SendRequest(searchRequest);
-
-                    if (response.Entries.Count > 0)
+                    if (!connResult.Success || connResult.Connection == null)
                     {
-                        var entry = response.Entries[0];
-                        var memberOf = entry.Attributes["memberOf"];
-                        if (memberOf != null)
+                        _logger.LogError("Failed to connect for GetUserGroups: {Errors}", connResult.ErrorMessage);
+                        return groups;
+                    }
+
+                    using (connResult.Connection)
+                    {
+                        var filter = BuildUserFilter(username);
+                        var searchRequest = new System.DirectoryServices.Protocols.SearchRequest(
+                            _settings.BaseDN,
+                            filter,
+                            SearchScope.Subtree,
+                            new[] { "memberOf" });
+
+                        var response = (SearchResponse)connResult.Connection.SendRequest(searchRequest);
+
+                        if (response.Entries.Count > 0)
                         {
-                            foreach (string groupDn in memberOf.GetValues(typeof(string)))
+                            var entry = response.Entries[0];
+                            var memberOf = entry.Attributes["memberOf"];
+                            if (memberOf != null)
                             {
-                                var groupName = ExtractCnFromDn(groupDn);
-                                if (!string.IsNullOrEmpty(groupName))
+                                foreach (string groupDn in memberOf.GetValues(typeof(string)))
                                 {
-                                    groups.Add(groupName);
+                                    var groupName = ExtractCnFromDn(groupDn);
+                                    if (!string.IsNullOrEmpty(groupName))
+                                    {
+                                        groups.Add(groupName);
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    if (_settings.EnableCache)
-                    {
-                        _cache.Set(cacheKey, groups, TimeSpan.FromMinutes(_settings.CacheDurationMinutes));
+                        if (_settings.EnableCache)
+                        {
+                            _cache.Set(cacheKey, groups, TimeSpan.FromMinutes(_settings.CacheDurationMinutes));
+                        }
                     }
                 }
                 catch (Exception ex)
