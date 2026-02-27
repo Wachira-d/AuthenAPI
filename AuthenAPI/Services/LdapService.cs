@@ -637,13 +637,13 @@ public class LdapService : ILdapService
             {
                 var errorMsg = $"Strategy '{strategy.Name}': LDAP Error {ex.ErrorCode} - {ex.Message}";
                 errors.Add(errorMsg);
-                _logger.LogDebug("✗ {Error}", errorMsg);
+                _logger.LogWarning("✗ {Error}", errorMsg);
             }
             catch (Exception ex)
             {
                 var errorMsg = $"Strategy '{strategy.Name}': {ex.GetType().Name} - {ex.Message}";
                 errors.Add(errorMsg);
-                _logger.LogDebug("✗ {Error}", errorMsg);
+                _logger.LogWarning("✗ {Error}", errorMsg);
             }
         }
 
