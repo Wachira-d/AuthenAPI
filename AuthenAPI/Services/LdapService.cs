@@ -1,6 +1,7 @@
 using AuthenAPI.Models;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Options;
+using System.DirectoryServices.AccountManagement;
 using System.DirectoryServices.Protocols;
 using System.Net;
 
@@ -65,108 +66,74 @@ public class LdapService : ILdapService
                 {
                     _logger.LogInformation("=== Starting Authentication for: {Username} ===", username);
 
-                    // Step 1: Try to connect with service account using multi-strategy
-                    _logger.LogDebug("Step 1: Establishing service connection...");
+                    // Step 1: Authenticate user credentials using combined fallback approach
+                    _logger.LogDebug("Step 1: Authenticating user credentials (with fallback methods)...");
+                    var (authSuccess, authMethod, usernameUsed) = AuthenticateWithFallback(username, password);
+
+                    if (!authSuccess)
+                    {
+                        _logger.LogWarning("All authentication methods failed for user: {Username}", username);
+                        return null;
+                    }
+
+                    _logger.LogInformation("✓ User authenticated successfully: {Username} using method: {Method} (format: {Format})",
+                        username, authMethod, usernameUsed);
+
+                    // Step 2: Try to get user details with service account
+                    _logger.LogDebug("Step 2: Fetching user details...");
                     var svcResult = TryMultipleConnectionStrategies(
                         _settings.ServiceAccountUsername,
                         _settings.ServiceAccountPassword);
 
-                    if (!svcResult.Success || svcResult.Connection == null)
+                    string searchIdentifier = usernameUsed ?? username;
+                    // Extract SAM from email/UPN format for search
+                    if (searchIdentifier.Contains("@"))
                     {
-                        _logger.LogError("Failed to establish service connection. Cannot authenticate user.");
-                        _logger.LogError("Service account connection errors: {Errors}", svcResult.ErrorMessage);
-                        return null;
+                        searchIdentifier = searchIdentifier.Split('@')[0];
+                    }
+                    if (searchIdentifier.Contains("\\"))
+                    {
+                        searchIdentifier = searchIdentifier.Split('\\')[1];
                     }
 
-                    _logger.LogInformation("Service connection established using strategy: {Strategy}",
-                        svcResult.StrategyName);
-
-                    // Step 2: Search for user to get their info
-                    string searchIdentifier = username;
-                    string? userPrincipalName = null;
-
-                    using (svcResult.Connection)
+                    if (svcResult.Success && svcResult.Connection != null)
                     {
-                        _logger.LogDebug("Step 2: Searching for user: {Username}", username);
-                        var userInfo = SearchUser(svcResult.Connection, username);
-
-                        if (userInfo == null)
+                        using (svcResult.Connection)
                         {
-                            _logger.LogWarning("User not found: {Username}", username);
-                            return null;
-                        }
+                            var result = SearchUser(svcResult.Connection, searchIdentifier);
 
-                        userPrincipalName = userInfo.UserPrincipalName;
-                        searchIdentifier = userInfo.SamAccountName ?? username;
-                        _logger.LogInformation("User found: {DisplayName} ({SAM})",
-                            userInfo.DisplayName, userInfo.SamAccountName);
-                    }
-
-                    // Step 3: Authenticate user with their credentials using multi-strategy
-                    _logger.LogDebug("Step 3: Authenticating user credentials...");
-                    var authResult = TryMultipleConnectionStrategies(username, password);
-
-                    if (!authResult.Success)
-                    {
-                        // Try with UPN if different from input
-                        if (!string.IsNullOrEmpty(userPrincipalName) &&
-                            !userPrincipalName.Equals(username, StringComparison.OrdinalIgnoreCase))
-                        {
-                            _logger.LogDebug("Retrying authentication with UPN: {UPN}", userPrincipalName);
-                            authResult = TryMultipleConnectionStrategies(userPrincipalName, password);
-                        }
-
-                        // Try with SAM account name
-                        if (!authResult.Success && !searchIdentifier.Equals(username, StringComparison.OrdinalIgnoreCase))
-                        {
-                            _logger.LogDebug("Retrying authentication with SAM: {SAM}", searchIdentifier);
-                            authResult = TryMultipleConnectionStrategies(searchIdentifier, password);
-                        }
-                    }
-
-                    if (!authResult.Success)
-                    {
-                        _logger.LogWarning("Authentication failed for user: {Username}", username);
-                        _logger.LogDebug("Auth errors: {Errors}", authResult.ErrorMessage);
-                        return null;
-                    }
-
-                    _logger.LogInformation("✓ User authenticated successfully: {Username} using strategy: {Strategy}",
-                        username, authResult.StrategyName);
-
-                    // Dispose auth connection - we just needed to verify credentials
-                    authResult.Connection?.Dispose();
-
-                    // Step 4: Get full user info with service account
-                    _logger.LogDebug("Step 4: Fetching user details...");
-                    var svcResult2 = TryMultipleConnectionStrategies(
-                        _settings.ServiceAccountUsername,
-                        _settings.ServiceAccountPassword);
-
-                    if (svcResult2.Success && svcResult2.Connection != null)
-                    {
-                        using (svcResult2.Connection)
-                        {
-                            var result = SearchUser(svcResult2.Connection, searchIdentifier);
-
-                            if (result != null && _settings.EnableCache)
+                            if (result != null)
                             {
-                                CacheUserInfo(searchIdentifier, result);
-                                if (!string.IsNullOrEmpty(result.Email) &&
-                                    !result.Email.Equals(searchIdentifier, StringComparison.OrdinalIgnoreCase))
+                                if (_settings.EnableCache)
                                 {
-                                    CacheUserInfo(result.Email, result);
+                                    CacheUserInfo(searchIdentifier, result);
+                                    if (!string.IsNullOrEmpty(result.Email) &&
+                                        !result.Email.Equals(searchIdentifier, StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        CacheUserInfo(result.Email, result);
+                                    }
                                 }
+
+                                _logger.LogInformation("=== Authentication completed successfully for: {Username} in {Ms}ms ===",
+                                    username, stopwatch.ElapsedMilliseconds);
+                                return result;
                             }
 
-                            _logger.LogInformation("=== Authentication completed successfully for: {Username} in {Ms}ms ===",
-                                username, stopwatch.ElapsedMilliseconds);
-                            return result;
+                            // User authenticated but couldn't get details - return basic info
+                            _logger.LogWarning("User authenticated but details not found. Returning basic info.");
                         }
                     }
 
-                    _logger.LogWarning("Could not fetch user details after authentication");
-                    return null;
+                    // Fallback: Return basic user info if we can't get full details
+                    _logger.LogWarning("Could not fetch user details. Returning basic authenticated user info.");
+                    return new UserInfo
+                    {
+                        SamAccountName = searchIdentifier,
+                        UserPrincipalName = usernameUsed,
+                        DisplayName = searchIdentifier,
+                        Email = username.Contains("@") ? username : null,
+                        IsEnabled = true
+                    };
                 }
                 catch (LdapException ex) when (ex.ErrorCode == 49)
                 {
@@ -974,6 +941,134 @@ public class LdapService : ILdapService
 
         return null;
     }
+
+    #region Fallback Authentication Methods
+
+    /// <summary>
+    /// Fallback authentication using PrincipalContext (System.DirectoryServices.AccountManagement)
+    /// This is simpler and may work when LDAP protocol methods fail
+    /// </summary>
+    private bool ValidateCredentialsFallback(string username, string password)
+    {
+        var servers = new[] { _settings.Server, _settings.Domain };
+        var userFormats = GetUsernameFormats(username);
+
+        foreach (var server in servers.Where(s => !string.IsNullOrEmpty(s)))
+        {
+            foreach (var userFormat in userFormats)
+            {
+                try
+                {
+                    _logger.LogDebug("Fallback auth attempt - Server: {Server}, User: {User}", server, userFormat);
+
+                    using var pc = new PrincipalContext(ContextType.Domain, server);
+                    var isValid = pc.ValidateCredentials(userFormat, password);
+
+                    if (isValid)
+                    {
+                        _logger.LogInformation("✓ FALLBACK AUTH SUCCESS - Server: {Server}, User: {User}",
+                            server, userFormat);
+                        return true;
+                    }
+
+                    _logger.LogDebug("✗ Fallback auth failed - Server: {Server}, User: {User}", server, userFormat);
+                }
+                catch (PrincipalServerDownException ex)
+                {
+                    _logger.LogDebug("✗ Fallback server down - Server: {Server}, Error: {Error}", server, ex.Message);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug("✗ Fallback auth error - Server: {Server}, Error: {Error}", server, ex.Message);
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Get multiple username formats to try for authentication
+    /// </summary>
+    private string[] GetUsernameFormats(string username)
+    {
+        var formats = new List<string>();
+
+        // Original format
+        formats.Add(username);
+
+        if (username.Contains("@"))
+        {
+            // Extract SAM from email/UPN
+            var sam = username.Split('@')[0];
+            formats.Add(sam);
+            formats.Add($"{sam}@{_settings.Domain}");
+            formats.Add($"IPSOSGROUP\\{sam}");
+        }
+        else
+        {
+            // Add UPN and NetBIOS formats
+            formats.Add($"{username}@{_settings.Domain}");
+            formats.Add($"{username}@ipsos.com");
+            formats.Add($"IPSOSGROUP\\{username}");
+        }
+
+        return formats.Distinct().ToArray();
+    }
+
+    /// <summary>
+    /// Combined authentication: Try LDAP first, then fallback to PrincipalContext
+    /// </summary>
+    private (bool Success, string Method, string? UsernameUsed) AuthenticateWithFallback(string username, string password)
+    {
+        // Method 1: Try multi-strategy LDAP connection
+        _logger.LogDebug("Trying Method 1: Multi-strategy LDAP authentication");
+        var ldapResult = TryMultipleConnectionStrategies(username, password);
+
+        if (ldapResult.Success)
+        {
+            ldapResult.Connection?.Dispose();
+            return (true, $"LDAP-{ldapResult.StrategyName}", ldapResult.UsernameFormat);
+        }
+
+        // Method 2: Try PrincipalContext fallback
+        _logger.LogDebug("Method 1 failed. Trying Method 2: PrincipalContext fallback");
+        var userFormats = GetUsernameFormats(username);
+
+        foreach (var userFormat in userFormats)
+        {
+            if (ValidateCredentialsFallback(userFormat, password))
+            {
+                return (true, "PrincipalContext-Fallback", userFormat);
+            }
+        }
+
+        // Method 3: Try direct LDAP bind with different options
+        _logger.LogDebug("Method 2 failed. Trying Method 3: Direct LDAP simple bind");
+        foreach (var userFormat in userFormats)
+        {
+            try
+            {
+                using var conn = new LdapConnection(
+                    new LdapDirectoryIdentifier(_settings.Server, 389));
+                conn.AuthType = AuthType.Basic;
+                conn.SessionOptions.ProtocolVersion = 3;
+                conn.Credential = new NetworkCredential(userFormat, password);
+                conn.Bind();
+
+                _logger.LogInformation("✓ DIRECT BIND SUCCESS - User: {User}", userFormat);
+                return (true, "DirectBind-389", userFormat);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug("✗ Direct bind failed for {User}: {Error}", userFormat, ex.Message);
+            }
+        }
+
+        return (false, "AllMethodsFailed", null);
+    }
+
+    #endregion
 
     #endregion
 }
