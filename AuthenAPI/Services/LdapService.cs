@@ -143,7 +143,22 @@ public class LdapService : ILdapService
     /// <inheritdoc />
     public async Task<bool> TestConnectionAsync()
     {
+        var result = await TestConnectionDetailedAsync();
+        return result.Success;
+    }
+
+    /// <summary>
+    /// Test connection with detailed diagnostics trying multiple strategies
+    /// </summary>
+    public async Task<ConnectionTestResult> TestConnectionDetailedAsync()
+    {
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var testResult = new ConnectionTestResult
+        {
+            Server = _settings.Server,
+            ConfiguredPort = _settings.Port,
+            TestStartTime = DateTime.UtcNow
+        };
 
         try
         {
@@ -151,25 +166,158 @@ public class LdapService : ILdapService
 
             return await Task.Run(() =>
             {
-                try
+                _logger.LogInformation("=== Starting LDAP Connection Diagnostics ===");
+                _logger.LogInformation("Target Server: {Server}", _settings.Server);
+                _logger.LogInformation("Configured Port: {Port}", _settings.Port);
+                _logger.LogInformation("Use SSL: {UseSSL}", _settings.UseSSL);
+                _logger.LogInformation("Service Account: {Account}", _settings.ServiceAccountUsername);
+
+                var strategies = BuildConnectionStrategies();
+                _logger.LogInformation("Testing {Count} connection strategies...", strategies.Count);
+
+                foreach (var strategy in strategies)
                 {
-                    using var connection = CreateServiceConnection();
-                    _logger.LogInformation("LDAP connection test successful to {Server}:{Port} in {Ms}ms",
-                        _settings.Server, _settings.Port, stopwatch.ElapsedMilliseconds);
-                    return true;
+                    var attemptResult = new ConnectionAttemptResult
+                    {
+                        StrategyName = strategy.Name,
+                        Server = strategy.Server,
+                        Port = strategy.Port,
+                        UseSSL = strategy.UseSSL,
+                        AuthType = strategy.AuthType.ToString()
+                    };
+
+                    try
+                    {
+                        var formattedUsername = strategy.UsernameFormatter(
+                            _settings.ServiceAccountUsername, _settings.Domain);
+                        attemptResult.UsernameFormat = formattedUsername;
+
+                        var attemptStopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+                        using var connection = CreateConnectionWithStrategy(
+                            formattedUsername,
+                            _settings.ServiceAccountPassword,
+                            strategy);
+
+                        attemptStopwatch.Stop();
+                        attemptResult.Success = true;
+                        attemptResult.ResponseTimeMs = attemptStopwatch.ElapsedMilliseconds;
+
+                        _logger.LogInformation(
+                            "✓ SUCCESS: {Strategy} | Server: {Server}:{Port} | SSL: {SSL} | User: {User} | Time: {Time}ms",
+                            strategy.Name, strategy.Server, strategy.Port, strategy.UseSSL,
+                            formattedUsername, attemptStopwatch.ElapsedMilliseconds);
+
+                        testResult.SuccessfulStrategies.Add(attemptResult);
+
+                        // First success - record as recommended
+                        if (testResult.RecommendedStrategy == null)
+                        {
+                            testResult.RecommendedStrategy = attemptResult;
+                            testResult.Success = true;
+                        }
+
+                        connection.Dispose();
+                    }
+                    catch (LdapException ex)
+                    {
+                        attemptResult.Success = false;
+                        attemptResult.ErrorCode = ex.ErrorCode;
+                        attemptResult.ErrorMessage = $"LDAP Error {ex.ErrorCode}: {GetLdapErrorDescription(ex.ErrorCode)} - {ex.Message}";
+
+                        _logger.LogDebug("✗ FAILED: {Strategy} | Error: {Error}",
+                            strategy.Name, attemptResult.ErrorMessage);
+
+                        testResult.FailedStrategies.Add(attemptResult);
+                    }
+                    catch (Exception ex)
+                    {
+                        attemptResult.Success = false;
+                        attemptResult.ErrorMessage = $"{ex.GetType().Name}: {ex.Message}";
+
+                        _logger.LogDebug("✗ FAILED: {Strategy} | Error: {Error}",
+                            strategy.Name, attemptResult.ErrorMessage);
+
+                        testResult.FailedStrategies.Add(attemptResult);
+                    }
                 }
-                catch (Exception ex)
+
+                stopwatch.Stop();
+                testResult.TotalTestTimeMs = stopwatch.ElapsedMilliseconds;
+
+                // Log summary
+                _logger.LogInformation("=== Connection Test Summary ===");
+                _logger.LogInformation("Total strategies tested: {Total}", strategies.Count);
+                _logger.LogInformation("Successful: {Success}", testResult.SuccessfulStrategies.Count);
+                _logger.LogInformation("Failed: {Failed}", testResult.FailedStrategies.Count);
+                _logger.LogInformation("Total test time: {Time}ms", testResult.TotalTestTimeMs);
+
+                if (testResult.RecommendedStrategy != null)
                 {
-                    _logger.LogError(ex, "LDAP connection test failed to {Server}:{Port}",
-                        _settings.Server, _settings.Port);
-                    return false;
+                    _logger.LogInformation("*** RECOMMENDED STRATEGY: {Strategy} ***",
+                        testResult.RecommendedStrategy.StrategyName);
+                    _logger.LogInformation("    Server: {Server}:{Port}",
+                        testResult.RecommendedStrategy.Server, testResult.RecommendedStrategy.Port);
+                    _logger.LogInformation("    SSL: {SSL}", testResult.RecommendedStrategy.UseSSL);
+                    _logger.LogInformation("    Username Format: {Format}", testResult.RecommendedStrategy.UsernameFormat);
                 }
+                else
+                {
+                    _logger.LogError("*** NO WORKING STRATEGY FOUND ***");
+
+                    // Log most common errors
+                    var errorGroups = testResult.FailedStrategies
+                        .Where(f => f.ErrorCode.HasValue)
+                        .GroupBy(f => f.ErrorCode)
+                        .OrderByDescending(g => g.Count());
+
+                    foreach (var group in errorGroups.Take(3))
+                    {
+                        _logger.LogError("Common Error Code {Code}: {Description} ({Count} occurrences)",
+                            group.Key, GetLdapErrorDescription(group.Key ?? 0), group.Count());
+                    }
+                }
+
+                return testResult;
             });
         }
         finally
         {
             _connectionLock.Release();
         }
+    }
+
+    /// <summary>
+    /// Get human-readable LDAP error description
+    /// </summary>
+    private static string GetLdapErrorDescription(int errorCode)
+    {
+        return errorCode switch
+        {
+            0 => "Success",
+            1 => "Operations Error",
+            2 => "Protocol Error",
+            3 => "Time Limit Exceeded",
+            4 => "Size Limit Exceeded",
+            7 => "Authentication Method Not Supported",
+            8 => "Strong Auth Required",
+            32 => "No Such Object (Invalid BaseDN or User not found)",
+            34 => "Invalid DN Syntax",
+            48 => "Inappropriate Authentication",
+            49 => "Invalid Credentials (Wrong username/password)",
+            50 => "Insufficient Access Rights",
+            51 => "Server Busy",
+            52 => "Server Unavailable",
+            53 => "Unwilling To Perform",
+            65 => "Object Class Violation",
+            81 => "Server Down / Cannot Connect",
+            82 => "Local Error",
+            83 => "Encoding Error",
+            84 => "Decoding Error",
+            85 => "Connection Timeout",
+            91 => "Connect Error (Network issue or SSL handshake failed)",
+            _ => $"Unknown Error ({errorCode})"
+        };
     }
 
     /// <inheritdoc />
@@ -354,6 +502,186 @@ public class LdapService : ILdapService
 
     #region Private Helper Methods
 
+    /// <summary>
+    /// Connection strategy for multi-format LDAP authentication
+    /// </summary>
+    private class ConnectionStrategy
+    {
+        public string Name { get; set; } = "";
+        public string Server { get; set; } = "";
+        public int Port { get; set; }
+        public bool UseSSL { get; set; }
+        public AuthType AuthType { get; set; }
+        public Func<string, string, string> UsernameFormatter { get; set; } = (u, d) => u;
+    }
+
+    /// <summary>
+    /// Result of connection attempt with strategy info
+    /// </summary>
+    public class ConnectionResult
+    {
+        public bool Success { get; set; }
+        public string StrategyName { get; set; } = "";
+        public string UsernameFormat { get; set; } = "";
+        public string? ErrorMessage { get; set; }
+        public LdapConnection? Connection { get; set; }
+    }
+
+    /// <summary>
+    /// Try multiple connection strategies and return the first successful one
+    /// </summary>
+    private ConnectionResult TryMultipleConnectionStrategies(string username, string password)
+    {
+        var strategies = BuildConnectionStrategies();
+        var errors = new List<string>();
+
+        foreach (var strategy in strategies)
+        {
+            try
+            {
+                var formattedUsername = strategy.UsernameFormatter(username, _settings.Domain);
+
+                _logger.LogDebug("Trying connection strategy: {Strategy} with username format: {Username}",
+                    strategy.Name, formattedUsername);
+
+                var connection = CreateConnectionWithStrategy(formattedUsername, password, strategy);
+
+                _logger.LogInformation(
+                    "✓ CONNECTION SUCCESS - Strategy: {Strategy}, Server: {Server}:{Port}, SSL: {UseSSL}, Username: {Username}",
+                    strategy.Name, strategy.Server, strategy.Port, strategy.UseSSL, formattedUsername);
+
+                return new ConnectionResult
+                {
+                    Success = true,
+                    StrategyName = strategy.Name,
+                    UsernameFormat = formattedUsername,
+                    Connection = connection
+                };
+            }
+            catch (LdapException ex)
+            {
+                var errorMsg = $"Strategy '{strategy.Name}': LDAP Error {ex.ErrorCode} - {ex.Message}";
+                errors.Add(errorMsg);
+                _logger.LogDebug("✗ {Error}", errorMsg);
+            }
+            catch (Exception ex)
+            {
+                var errorMsg = $"Strategy '{strategy.Name}': {ex.GetType().Name} - {ex.Message}";
+                errors.Add(errorMsg);
+                _logger.LogDebug("✗ {Error}", errorMsg);
+            }
+        }
+
+        // All strategies failed
+        _logger.LogWarning("All connection strategies failed for user: {Username}. Errors:\n{Errors}",
+            username, string.Join("\n", errors));
+
+        return new ConnectionResult
+        {
+            Success = false,
+            ErrorMessage = string.Join("; ", errors)
+        };
+    }
+
+    /// <summary>
+    /// Build list of connection strategies to try
+    /// </summary>
+    private List<ConnectionStrategy> BuildConnectionStrategies()
+    {
+        var strategies = new List<ConnectionStrategy>();
+        var servers = new[] { _settings.Server };
+
+        // Port combinations to try
+        var portConfigs = new[]
+        {
+            (Port: 636, UseSSL: true, Name: "LDAPS-636"),
+            (Port: 389, UseSSL: false, Name: "LDAP-389"),
+            (Port: 3269, UseSSL: true, Name: "GC-SSL-3269"),
+            (Port: 3268, UseSSL: false, Name: "GC-3268")
+        };
+
+        // Username format functions
+        var usernameFormats = new (string Name, Func<string, string, string> Formatter)[]
+        {
+            ("UPN", (u, d) => u.Contains("@") ? u : $"{u}@{d}"),
+            ("UPN-Email", (u, d) => u.Contains("@") ? u : $"{u}@ipsos.com"),
+            ("NetBIOS", (u, d) => {
+                var domainShort = d.Split('.')[0].ToUpperInvariant();
+                var cleanUser = u.Contains("@") ? u.Split('@')[0] : u;
+                return $"{domainShort}\\{cleanUser}";
+            }),
+            ("SAM-Only", (u, d) => u.Contains("@") ? u.Split('@')[0] : u),
+            ("DN-Format", (u, d) => {
+                var cleanUser = u.Contains("@") ? u.Split('@')[0] : u;
+                var dcParts = d.Split('.').Select(p => $"DC={p}").ToArray();
+                return $"CN={cleanUser},CN=Users,{string.Join(",", dcParts)}";
+            })
+        };
+
+        // Build all combinations - prioritize LDAPS with UPN first
+        foreach (var portConfig in portConfigs)
+        {
+            foreach (var format in usernameFormats)
+            {
+                foreach (var server in servers)
+                {
+                    strategies.Add(new ConnectionStrategy
+                    {
+                        Name = $"{portConfig.Name}-{format.Name}",
+                        Server = server,
+                        Port = portConfig.Port,
+                        UseSSL = portConfig.UseSSL,
+                        AuthType = AuthType.Basic,
+                        UsernameFormatter = format.Formatter
+                    });
+                }
+            }
+        }
+
+        // Also try Negotiate auth type for Windows integrated auth
+        strategies.Add(new ConnectionStrategy
+        {
+            Name = "LDAPS-Negotiate",
+            Server = _settings.Server,
+            Port = 636,
+            UseSSL = true,
+            AuthType = AuthType.Negotiate,
+            UsernameFormatter = (u, d) => u.Contains("@") ? u : $"{u}@{d}"
+        });
+
+        return strategies;
+    }
+
+    /// <summary>
+    /// Create connection using specific strategy
+    /// </summary>
+    private LdapConnection CreateConnectionWithStrategy(string username, string password, ConnectionStrategy strategy)
+    {
+        var identifier = new LdapDirectoryIdentifier(strategy.Server, strategy.Port);
+        var credential = new NetworkCredential(username, password);
+        var connection = new LdapConnection(identifier, credential)
+        {
+            AuthType = strategy.AuthType,
+            AutoBind = false
+        };
+
+        connection.SessionOptions.ProtocolVersion = 3;
+        connection.Timeout = TimeSpan.FromSeconds(_settings.ConnectionTimeout);
+
+        if (strategy.UseSSL)
+        {
+            connection.SessionOptions.SecureSocketLayer = true;
+
+            if (_settings.SkipCertificateValidation)
+            {
+                connection.SessionOptions.VerifyServerCertificate = (conn, cert) => true;
+            }
+        }
+
+        connection.Bind();
+        return connection;
+    }
+
     private LdapConnection CreateConnection(string username, string password)
     {
         var identifier = new LdapDirectoryIdentifier(_settings.Server, _settings.Port);
@@ -390,6 +718,23 @@ public class LdapService : ILdapService
         }
 
         return CreateConnection(bindDn, _settings.ServiceAccountPassword);
+    }
+
+    /// <summary>
+    /// Create service connection trying multiple strategies
+    /// </summary>
+    private LdapConnection CreateServiceConnectionMultiStrategy()
+    {
+        var result = TryMultipleConnectionStrategies(
+            _settings.ServiceAccountUsername,
+            _settings.ServiceAccountPassword);
+
+        if (result.Success && result.Connection != null)
+        {
+            return result.Connection;
+        }
+
+        throw new LdapException($"All connection strategies failed: {result.ErrorMessage}");
     }
 
     private UserInfo? SearchUser(LdapConnection connection, string username)

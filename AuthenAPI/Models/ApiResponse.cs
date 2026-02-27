@@ -56,6 +56,19 @@ public class ApiResponse<T>
             Error = error
         };
     }
+
+    /// <summary>
+    /// Creates a failed response with data (useful for diagnostic info)
+    /// </summary>
+    public static ApiResponse<T> Fail(string message, T? data)
+    {
+        return new ApiResponse<T>
+        {
+            Success = false,
+            Message = message,
+            Data = data
+        };
+    }
 }
 
 /// <summary>

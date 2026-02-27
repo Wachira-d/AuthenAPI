@@ -22,6 +22,12 @@ public interface ILdapService
     Task<bool> TestConnectionAsync();
 
     /// <summary>
+    /// Test connection with detailed diagnostics trying multiple strategies
+    /// </summary>
+    /// <returns>Detailed test result with all strategies tried</returns>
+    Task<ConnectionTestResult> TestConnectionDetailedAsync();
+
+    /// <summary>
     /// Get user information by username
     /// </summary>
     /// <param name="username">Username (sAMAccountName or UPN)</param>

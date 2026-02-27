@@ -65,6 +65,43 @@ public class LdapController : ControllerBase
     }
 
     /// <summary>
+    /// Test connection with detailed diagnostics - tries multiple strategies and reports which ones work
+    /// </summary>
+    /// <returns>Detailed connection test results</returns>
+    [HttpGet("test-connection/detailed")]
+    [ProducesResponseType(typeof(ApiResponse<ConnectionTestResult>), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ApiResponse<ConnectionTestResult>), StatusCodes.Status503ServiceUnavailable)]
+    public async Task<IActionResult> TestConnectionDetailed()
+    {
+        var stopwatch = Stopwatch.StartNew();
+        _logger.LogInformation("Starting detailed LDAP connection diagnostics");
+
+        var result = await _ldapService.TestConnectionDetailedAsync();
+        stopwatch.Stop();
+
+        await _auditService.LogAsync(new AuditLog
+        {
+            Action = AuditAction.TestConnection,
+            Success = result.Success,
+            IpAddress = GetClientIpAddress(),
+            UserAgent = GetUserAgent(),
+            RequestPath = Request.Path,
+            HttpMethod = Request.Method,
+            DurationMs = stopwatch.ElapsedMilliseconds,
+            StatusCode = result.Success ? 200 : 503,
+            Details = result.Summary
+        });
+
+        if (result.Success)
+        {
+            return Ok(ApiResponse<ConnectionTestResult>.Ok(result, result.Summary));
+        }
+
+        return StatusCode(StatusCodes.Status503ServiceUnavailable,
+            ApiResponse<ConnectionTestResult>.Fail(result.Summary, result));
+    }
+
+    /// <summary>
     /// Authenticate a user against Active Directory
     /// </summary>
     /// <param name="request">Authentication credentials</param>
