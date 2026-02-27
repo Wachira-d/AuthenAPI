@@ -85,7 +85,7 @@ public class LdapService : ILdapService
 
                     // Extract SAM from the username used for search
                     string searchIdentifier = ExtractSamAccountName(usernameUsed ?? username);
-                    _logger.LogDebug("Search identifier (SAM): {SAM}", searchIdentifier);
+                    _logger.LogInformation("Search identifier (SAM): {SAM}", searchIdentifier);
 
                     // Prepare basic user info (return immediately if search fails/timeout)
                     var basicUserInfo = new UserInfo
@@ -98,20 +98,24 @@ public class LdapService : ILdapService
                     };
 
                     // Step 2: Try to get user details with service account (with timeout)
-                    _logger.LogDebug("Step 2: Fetching user details (timeout: 10s)...");
+                    _logger.LogInformation("Step 2: Fetching user details (timeout: 10s)...");
 
                     try
                     {
                         var searchTask = Task.Run(() =>
                         {
+                            _logger.LogInformation("Connecting with service account...");
                             var svcResult = TryMultipleConnectionStrategies(
                                 _settings.ServiceAccountUsername,
                                 _settings.ServiceAccountPassword);
+
+                            _logger.LogInformation("Service account connection result: {Success}", svcResult.Success);
 
                             if (svcResult.Success && svcResult.Connection != null)
                             {
                                 using (svcResult.Connection)
                                 {
+                                    _logger.LogInformation("Searching for user: {SAM}", searchIdentifier);
                                     return SearchUser(svcResult.Connection, searchIdentifier);
                                 }
                             }
@@ -119,6 +123,7 @@ public class LdapService : ILdapService
                         });
 
                         // Wait max 10 seconds for user details
+                        _logger.LogInformation("Waiting for search task (max 10s)...");
                         if (searchTask.Wait(TimeSpan.FromSeconds(10)))
                         {
                             var result = searchTask.Result;
@@ -810,7 +815,7 @@ public class LdapService : ILdapService
     private UserInfo? SearchUser(LdapConnection connection, string username)
     {
         var filter = BuildUserFilter(username);
-        _logger.LogDebug("SearchUser filter: {Filter}", filter);
+        _logger.LogInformation("SearchUser filter: {Filter}", filter);
 
         var searchRequest = new System.DirectoryServices.Protocols.SearchRequest(
             _settings.BaseDN,
@@ -820,9 +825,10 @@ public class LdapService : ILdapService
 
         // Set timeout for search request (5 seconds)
         var searchTimeout = TimeSpan.FromSeconds(5);
+        _logger.LogInformation("Executing LDAP search (timeout: 5s)...");
         var response = (SearchResponse)connection.SendRequest(searchRequest, searchTimeout);
 
-        _logger.LogDebug("SearchUser found {Count} entries", response.Entries.Count);
+        _logger.LogInformation("SearchUser found {Count} entries", response.Entries.Count);
 
         if (response.Entries.Count > 0)
         {
