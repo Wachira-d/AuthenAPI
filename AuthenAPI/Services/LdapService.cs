@@ -83,22 +83,45 @@ public class LdapService : ILdapService
                     _logger.LogInformation("✓ User authenticated successfully: {Username} using method: {Method} (format: {Format})",
                         username, authMethod, usernameUsed);
 
-                    // Step 2: Try to get user details with service account
-                    _logger.LogDebug("Step 2: Fetching user details...");
-                    var svcResult = TryMultipleConnectionStrategies(
-                        _settings.ServiceAccountUsername,
-                        _settings.ServiceAccountPassword);
-
                     // Extract SAM from the username used for search
                     string searchIdentifier = ExtractSamAccountName(usernameUsed ?? username);
                     _logger.LogDebug("Search identifier (SAM): {SAM}", searchIdentifier);
 
-                    if (svcResult.Success && svcResult.Connection != null)
+                    // Prepare basic user info (return immediately if search fails/timeout)
+                    var basicUserInfo = new UserInfo
                     {
-                        using (svcResult.Connection)
-                        {
-                            var result = SearchUser(svcResult.Connection, searchIdentifier);
+                        SamAccountName = searchIdentifier,
+                        UserPrincipalName = usernameUsed,
+                        DisplayName = searchIdentifier,
+                        Email = username.Contains("@") ? username : null,
+                        IsEnabled = true
+                    };
 
+                    // Step 2: Try to get user details with service account (with timeout)
+                    _logger.LogDebug("Step 2: Fetching user details (timeout: 10s)...");
+
+                    try
+                    {
+                        var searchTask = Task.Run(() =>
+                        {
+                            var svcResult = TryMultipleConnectionStrategies(
+                                _settings.ServiceAccountUsername,
+                                _settings.ServiceAccountPassword);
+
+                            if (svcResult.Success && svcResult.Connection != null)
+                            {
+                                using (svcResult.Connection)
+                                {
+                                    return SearchUser(svcResult.Connection, searchIdentifier);
+                                }
+                            }
+                            return null;
+                        });
+
+                        // Wait max 10 seconds for user details
+                        if (searchTask.Wait(TimeSpan.FromSeconds(10)))
+                        {
+                            var result = searchTask.Result;
                             if (result != null)
                             {
                                 if (_settings.EnableCache)
@@ -111,26 +134,27 @@ public class LdapService : ILdapService
                                     }
                                 }
 
-                                _logger.LogInformation("=== Authentication completed successfully for: {Username} in {Ms}ms ===",
+                                _logger.LogInformation("=== Authentication completed with full details for: {Username} in {Ms}ms ===",
                                     username, stopwatch.ElapsedMilliseconds);
                                 return result;
                             }
 
-                            // User authenticated but couldn't get details - return basic info
                             _logger.LogWarning("User authenticated but details not found. Returning basic info.");
                         }
+                        else
+                        {
+                            _logger.LogWarning("User details search timed out (10s). Returning basic info.");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to fetch user details. Returning basic info.");
                     }
 
-                    // Fallback: Return basic user info if we can't get full details
-                    _logger.LogWarning("Could not fetch user details. Returning basic authenticated user info.");
-                    return new UserInfo
-                    {
-                        SamAccountName = searchIdentifier,
-                        UserPrincipalName = usernameUsed,
-                        DisplayName = searchIdentifier,
-                        Email = username.Contains("@") ? username : null,
-                        IsEnabled = true
-                    };
+                    // Return basic info - authentication was successful
+                    _logger.LogInformation("=== Authentication completed (basic info) for: {Username} in {Ms}ms ===",
+                        username, stopwatch.ElapsedMilliseconds);
+                    return basicUserInfo;
                 }
                 catch (LdapException ex) when (ex.ErrorCode == 49)
                 {
@@ -786,13 +810,19 @@ public class LdapService : ILdapService
     private UserInfo? SearchUser(LdapConnection connection, string username)
     {
         var filter = BuildUserFilter(username);
+        _logger.LogDebug("SearchUser filter: {Filter}", filter);
+
         var searchRequest = new System.DirectoryServices.Protocols.SearchRequest(
             _settings.BaseDN,
             filter,
             SearchScope.Subtree,
             UserAttributes);
 
-        var response = (SearchResponse)connection.SendRequest(searchRequest);
+        // Set timeout for search request (5 seconds)
+        var searchTimeout = TimeSpan.FromSeconds(5);
+        var response = (SearchResponse)connection.SendRequest(searchRequest, searchTimeout);
+
+        _logger.LogDebug("SearchUser found {Count} entries", response.Entries.Count);
 
         if (response.Entries.Count > 0)
         {
