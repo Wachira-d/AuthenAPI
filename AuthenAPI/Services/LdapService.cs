@@ -1,64 +1,40 @@
 using AuthenAPI.Models;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Options;
-using Novell.Directory.Ldap;
-using System.Security.Authentication;
+using System.DirectoryServices.Protocols;
+using System.Net;
 
 namespace AuthenAPI.Services;
 
 /// <summary>
-/// LDAP service implementation for Active Directory operations via LDAPS
-/// with connection pooling and caching for improved performance
+/// LDAP service implementation using System.DirectoryServices.Protocols
+/// for Active Directory operations via LDAPS with caching
 /// </summary>
 public class LdapService : ILdapService
 {
     private readonly LdapSettings _settings;
     private readonly ILogger<LdapService> _logger;
     private readonly IMemoryCache _cache;
-    private readonly SemaphoreSlim _connectionLock = new(10, 10); // Max 10 concurrent connections
+    private readonly SemaphoreSlim _connectionLock = new(10, 10);
 
-    // Cache keys
     private const string UserCachePrefix = "ldap_user_";
     private const string GroupsCachePrefix = "ldap_groups_";
 
-    // Common AD attributes to retrieve
     private static readonly string[] UserAttributes =
     {
-        "distinguishedName",
-        "sAMAccountName",
-        "userPrincipalName",
-        "displayName",
-        "givenName",
-        "sn",
-        "mail",
-        "department",
-        "title",
-        "physicalDeliveryOfficeName",
-        "telephoneNumber",
-        "mobile",
-        "manager",
-        "employeeID",
-        "company",
-        "userAccountControl",
-        "lockoutTime",
-        "memberOf",
-        "whenCreated",
-        "whenChanged",
-        "lastLogonTimestamp"
+        "distinguishedName", "sAMAccountName", "userPrincipalName",
+        "displayName", "givenName", "sn", "mail", "department",
+        "title", "physicalDeliveryOfficeName", "telephoneNumber",
+        "mobile", "manager", "employeeID", "company",
+        "userAccountControl", "lockoutTime", "memberOf",
+        "whenCreated", "whenChanged", "lastLogonTimestamp"
     };
 
-    // Minimal attributes for authentication (faster)
     private static readonly string[] AuthAttributes =
     {
-        "distinguishedName",
-        "sAMAccountName",
-        "userPrincipalName",
-        "displayName",
-        "mail",
-        "department",
-        "memberOf",
-        "userAccountControl",
-        "lockoutTime"
+        "distinguishedName", "sAMAccountName", "userPrincipalName",
+        "displayName", "mail", "department", "memberOf",
+        "userAccountControl", "lockoutTime"
     };
 
     public LdapService(IOptions<LdapSettings> settings, ILogger<LdapService> logger, IMemoryCache cache)
@@ -90,33 +66,27 @@ public class LdapService : ILdapService
                     string userPrincipal;
                     string searchIdentifier = username;
 
-                    // Check if input looks like an email (contains @ but not in domain format)
+                    // Check if input looks like an email
                     if (username.Contains("@"))
                     {
-                        // Check if it's already in UPN format (user@domain)
                         var domainPart = username.Split('@')[1];
                         if (domainPart.Equals(_settings.Domain, StringComparison.OrdinalIgnoreCase))
                         {
-                            // It's a UPN, use directly
                             userPrincipal = username;
                         }
                         else
                         {
-                            // It might be an email, search for the user first
+                            // Email login - search for user by email first
                             _logger.LogDebug("Input appears to be email, searching for user: {Email}", username);
 
-                            using var searchConnection = CreateConnection();
-                            searchConnection.Connect(_settings.Server, _settings.Port);
-                            ConnectAndBind(searchConnection);
-
-                            var userInfo = GetUserInfoFromConnection(searchConnection, username);
+                            using var searchConn = CreateServiceConnection();
+                            var userInfo = SearchUser(searchConn, username);
                             if (userInfo == null)
                             {
                                 _logger.LogWarning("User not found with email: {Email}", username);
                                 return null;
                             }
 
-                            // Use the found userPrincipalName for authentication
                             userPrincipal = userInfo.UserPrincipalName ?? $"{userInfo.SamAccountName}@{_settings.Domain}";
                             searchIdentifier = userInfo.SamAccountName ?? username;
                             _logger.LogDebug("Found user {SamAccountName} for email {Email}", userInfo.SamAccountName, username);
@@ -124,46 +94,35 @@ public class LdapService : ILdapService
                     }
                     else
                     {
-                        // Plain username, append domain
                         userPrincipal = $"{username}@{_settings.Domain}";
                     }
 
-                    // Now authenticate with the resolved userPrincipal
-                    using var connection = CreateConnection();
-                    try
+                    // Authenticate by binding with user credentials
+                    using var connection = CreateConnection(userPrincipal, password);
+
+                    // If we get here, bind succeeded - user is authenticated
+                    _logger.LogInformation("User authenticated successfully: {Username} in {Ms}ms",
+                        searchIdentifier, stopwatch.ElapsedMilliseconds);
+
+                    // Search for user info using service account
+                    using var svcConn = CreateServiceConnection();
+                    var result = SearchUser(svcConn, searchIdentifier);
+
+                    if (result != null && _settings.EnableCache)
                     {
-                        connection.Connect(_settings.Server, _settings.Port);
-                        connection.Bind(userPrincipal, password);
-
-                        if (connection.Bound)
+                        CacheUserInfo(searchIdentifier, result);
+                        if (!string.IsNullOrEmpty(result.Email) &&
+                            !result.Email.Equals(searchIdentifier, StringComparison.OrdinalIgnoreCase))
                         {
-                            _logger.LogInformation("User authenticated successfully: {Username} in {Ms}ms",
-                                searchIdentifier, stopwatch.ElapsedMilliseconds);
-
-                            // Get user info using the authenticated connection
-                            var userInfo = GetUserInfoFromConnection(connection, searchIdentifier);
-
-                            // Cache the user info
-                            if (userInfo != null && _settings.EnableCache)
-                            {
-                                CacheUserInfo(searchIdentifier, userInfo);
-                                // Also cache by email if different
-                                if (!string.IsNullOrEmpty(userInfo.Email) &&
-                                    !userInfo.Email.Equals(searchIdentifier, StringComparison.OrdinalIgnoreCase))
-                                {
-                                    CacheUserInfo(userInfo.Email, userInfo);
-                                }
-                            }
-
-                            return userInfo;
+                            CacheUserInfo(result.Email, result);
                         }
                     }
-                    catch (LdapException ex) when (ex.ResultCode == LdapException.InvalidCredentials)
-                    {
-                        _logger.LogWarning("Invalid credentials for user: {Username}", searchIdentifier);
-                        return null;
-                    }
 
+                    return result;
+                }
+                catch (LdapException ex) when (ex.ErrorCode == 49)
+                {
+                    _logger.LogWarning("Invalid credentials for user: {Username}", username);
                     return null;
                 }
                 catch (Exception ex)
@@ -194,8 +153,7 @@ public class LdapService : ILdapService
             {
                 try
                 {
-                    using var connection = CreateConnection();
-                    ConnectAndBind(connection);
+                    using var connection = CreateServiceConnection();
                     _logger.LogInformation("LDAP connection test successful to {Server}:{Port} in {Ms}ms",
                         _settings.Server, _settings.Port, stopwatch.ElapsedMilliseconds);
                     return true;
@@ -217,12 +175,8 @@ public class LdapService : ILdapService
     /// <inheritdoc />
     public async Task<UserInfo?> GetUserAsync(string username)
     {
-        if (string.IsNullOrWhiteSpace(username))
-        {
-            return null;
-        }
+        if (string.IsNullOrWhiteSpace(username)) return null;
 
-        // Check cache first
         var cacheKey = $"{UserCachePrefix}{username.ToLowerInvariant()}";
         if (_settings.EnableCache && _cache.TryGetValue(cacheKey, out UserInfo? cachedUser))
         {
@@ -238,12 +192,9 @@ public class LdapService : ILdapService
             {
                 try
                 {
-                    using var connection = CreateConnection();
-                    ConnectAndBind(connection);
+                    using var connection = CreateServiceConnection();
+                    var userInfo = SearchUser(connection, username);
 
-                    var userInfo = GetUserInfoFromConnection(connection, username);
-
-                    // Cache the result
                     if (userInfo != null && _settings.EnableCache)
                     {
                         CacheUserInfo(username, userInfo);
@@ -265,7 +216,7 @@ public class LdapService : ILdapService
     }
 
     /// <inheritdoc />
-    public async Task<List<UserInfo>> SearchUsersAsync(SearchRequest request)
+    public async Task<List<UserInfo>> SearchUsersAsync(Models.SearchRequest request)
     {
         try
         {
@@ -277,51 +228,33 @@ public class LdapService : ILdapService
 
                 try
                 {
-                    using var connection = CreateConnection();
-                    ConnectAndBind(connection);
+                    using var connection = CreateServiceConnection();
 
                     string filter;
-                    if (!string.IsNullOrEmpty(request.LdapFilter))
+                    if (!string.IsNullOrEmpty(request.Query))
                     {
-                        filter = request.LdapFilter;
-                    }
-                    else if (!string.IsNullOrEmpty(request.Query))
-                    {
-                        filter = $"(&(objectClass=user)(objectCategory=person)(|(displayName=*{EscapeLdapFilter(request.Query)}*)(sAMAccountName=*{EscapeLdapFilter(request.Query)}*)(mail=*{EscapeLdapFilter(request.Query)}*)(givenName=*{EscapeLdapFilter(request.Query)}*)(sn=*{EscapeLdapFilter(request.Query)}*)))";
+                        var escaped = EscapeLdapFilter(request.Query);
+                        filter = $"(&(objectClass=user)(objectCategory=person)(|(displayName=*{escaped}*)(sAMAccountName=*{escaped}*)(mail=*{escaped}*)(givenName=*{escaped}*)(sn=*{escaped}*)))";
                     }
                     else
                     {
                         filter = "(&(objectClass=user)(objectCategory=person))";
                     }
 
-                    var baseDn = request.BaseDN ?? _settings.BaseDN;
-
-                    var constraints = new LdapSearchConstraints
-                    {
-                        MaxResults = request.MaxResults,
-                        TimeLimit = _settings.ConnectionTimeout * 1000
-                    };
-
-                    var searchResults = connection.Search(
-                        baseDn,
-                        LdapConnection.ScopeSub,
+                    var searchRequest = new System.DirectoryServices.Protocols.SearchRequest(
+                        _settings.BaseDN,
                         filter,
-                        AuthAttributes, // Use minimal attributes for search
-                        false,
-                        constraints);
+                        SearchScope.Subtree,
+                        AuthAttributes);
+                    searchRequest.SizeLimit = request.MaxResults;
+                    searchRequest.TimeLimit = TimeSpan.FromSeconds(_settings.ConnectionTimeout);
 
-                    while (searchResults.HasMore() && users.Count < request.MaxResults)
+                    var response = (SearchResponse)connection.SendRequest(searchRequest);
+
+                    foreach (SearchResultEntry entry in response.Entries)
                     {
-                        try
-                        {
-                            var entry = searchResults.Next();
-                            var user = MapEntryToUserInfo(entry);
-                            users.Add(user);
-                        }
-                        catch (LdapException ex) when (ex.ResultCode == LdapException.SizeLimitExceeded)
-                        {
-                            break;
-                        }
+                        users.Add(MapEntryToUserInfo(entry));
+                        if (users.Count >= request.MaxResults) break;
                     }
 
                     _logger.LogInformation("Search returned {Count} users", users.Count);
@@ -343,12 +276,8 @@ public class LdapService : ILdapService
     /// <inheritdoc />
     public async Task<List<string>> GetUserGroupsAsync(string username)
     {
-        if (string.IsNullOrWhiteSpace(username))
-        {
-            return new List<string>();
-        }
+        if (string.IsNullOrWhiteSpace(username)) return new List<string>();
 
-        // Check cache first
         var cacheKey = $"{GroupsCachePrefix}{username.ToLowerInvariant()}";
         if (_settings.EnableCache && _cache.TryGetValue(cacheKey, out List<string>? cachedGroups))
         {
@@ -366,24 +295,24 @@ public class LdapService : ILdapService
 
                 try
                 {
-                    using var connection = CreateConnection();
-                    ConnectAndBind(connection);
+                    using var connection = CreateServiceConnection();
 
                     var filter = BuildUserFilter(username);
-                    var searchResults = connection.Search(
+                    var searchRequest = new System.DirectoryServices.Protocols.SearchRequest(
                         _settings.BaseDN,
-                        LdapConnection.ScopeSub,
                         filter,
-                        new[] { "memberOf" },
-                        false);
+                        SearchScope.Subtree,
+                        new[] { "memberOf" });
 
-                    if (searchResults.HasMore())
+                    var response = (SearchResponse)connection.SendRequest(searchRequest);
+
+                    if (response.Entries.Count > 0)
                     {
-                        var entry = searchResults.Next();
-                        var memberOf = entry.GetAttribute("memberOf");
+                        var entry = response.Entries[0];
+                        var memberOf = entry.Attributes["memberOf"];
                         if (memberOf != null)
                         {
-                            foreach (var groupDn in memberOf.StringValueArray)
+                            foreach (string groupDn in memberOf.GetValues(typeof(string)))
                             {
                                 var groupName = ExtractCnFromDn(groupDn);
                                 if (!string.IsNullOrEmpty(groupName))
@@ -394,7 +323,6 @@ public class LdapService : ILdapService
                         }
                     }
 
-                    // Cache the result
                     if (_settings.EnableCache)
                     {
                         _cache.Set(cacheKey, groups, TimeSpan.FromMinutes(_settings.CacheDurationMinutes));
@@ -418,9 +346,7 @@ public class LdapService : ILdapService
     public async Task<bool> IsUserInGroupAsync(string username, string groupName)
     {
         if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(groupName))
-        {
             return false;
-        }
 
         var groups = await GetUserGroupsAsync(username);
         return groups.Any(g => g.Equals(groupName, StringComparison.OrdinalIgnoreCase));
@@ -428,60 +354,58 @@ public class LdapService : ILdapService
 
     #region Private Helper Methods
 
-    private LdapConnection CreateConnection()
+    private LdapConnection CreateConnection(string username, string password)
     {
-        var connectionOptions = new LdapConnectionOptions();
+        var identifier = new LdapDirectoryIdentifier(_settings.Server, _settings.Port);
+        var credential = new NetworkCredential(username, password);
+        var connection = new LdapConnection(identifier, credential)
+        {
+            AuthType = AuthType.Basic,
+            AutoBind = false
+        };
+
+        connection.SessionOptions.ProtocolVersion = 3;
+        connection.Timeout = TimeSpan.FromSeconds(_settings.ConnectionTimeout);
 
         if (_settings.UseSSL)
         {
-            // Include TLS 1.0/1.1 for older AD servers compatibility
-            connectionOptions.ConfigureSslProtocols(SslProtocols.Tls | SslProtocols.Tls11 | SslProtocols.Tls12 | SslProtocols.Tls13);
+            connection.SessionOptions.SecureSocketLayer = true;
 
             if (_settings.SkipCertificateValidation)
             {
-                connectionOptions.ConfigureRemoteCertificateValidationCallback((sender, certificate, chain, errors) => true);
+                connection.SessionOptions.VerifyServerCertificate = (conn, cert) => true;
             }
         }
 
-        var connection = new LdapConnection(connectionOptions);
-
-        if (_settings.UseSSL)
-        {
-            connection.SecureSocketLayer = true;
-        }
-
-        // Use milliseconds for timeout
-        connection.ConnectionTimeout = _settings.ConnectionTimeout * 1000;
-
+        connection.Bind();
         return connection;
     }
 
-    private void ConnectAndBind(LdapConnection connection)
+    private LdapConnection CreateServiceConnection()
     {
-        connection.Connect(_settings.Server, _settings.Port);
-
         var bindDn = _settings.ServiceAccountUsername;
         if (!bindDn.Contains("@") && !bindDn.Contains(","))
         {
             bindDn = $"{bindDn}@{_settings.Domain}";
         }
 
-        connection.Bind(bindDn, _settings.ServiceAccountPassword);
+        return CreateConnection(bindDn, _settings.ServiceAccountPassword);
     }
 
-    private UserInfo? GetUserInfoFromConnection(LdapConnection connection, string username)
+    private UserInfo? SearchUser(LdapConnection connection, string username)
     {
         var filter = BuildUserFilter(username);
-        var searchResults = connection.Search(
+        var searchRequest = new System.DirectoryServices.Protocols.SearchRequest(
             _settings.BaseDN,
-            LdapConnection.ScopeSub,
             filter,
-            UserAttributes,
-            false);
+            SearchScope.Subtree,
+            UserAttributes);
 
-        if (searchResults.HasMore())
+        var response = (SearchResponse)connection.SendRequest(searchRequest);
+
+        if (response.Entries.Count > 0)
         {
-            return MapEntryToUserInfo(searchResults.Next());
+            return MapEntryToUserInfo(response.Entries[0]);
         }
 
         return null;
@@ -499,46 +423,45 @@ public class LdapService : ILdapService
 
     private static string BuildUserFilter(string username)
     {
-        var escapedUsername = EscapeLdapFilter(username);
-        // Search by sAMAccountName, userPrincipalName, or mail (email)
-        return $"(&(objectClass=user)(objectCategory=person)(|(sAMAccountName={escapedUsername})(userPrincipalName={escapedUsername})(mail={escapedUsername})))";
+        var escaped = EscapeLdapFilter(username);
+        return $"(&(objectClass=user)(objectCategory=person)(|(sAMAccountName={escaped})(userPrincipalName={escaped})(mail={escaped})))";
     }
 
-    private static UserInfo MapEntryToUserInfo(LdapEntry entry)
+    private static UserInfo MapEntryToUserInfo(SearchResultEntry entry)
     {
         var userInfo = new UserInfo
         {
-            DistinguishedName = entry.Dn,
-            SamAccountName = GetAttributeValue(entry, "sAMAccountName"),
-            UserPrincipalName = GetAttributeValue(entry, "userPrincipalName"),
-            DisplayName = GetAttributeValue(entry, "displayName"),
-            FirstName = GetAttributeValue(entry, "givenName"),
-            LastName = GetAttributeValue(entry, "sn"),
-            Email = GetAttributeValue(entry, "mail"),
-            Department = GetAttributeValue(entry, "department"),
-            Title = GetAttributeValue(entry, "title"),
-            Office = GetAttributeValue(entry, "physicalDeliveryOfficeName"),
-            Phone = GetAttributeValue(entry, "telephoneNumber"),
-            Mobile = GetAttributeValue(entry, "mobile"),
-            Manager = GetAttributeValue(entry, "manager"),
-            EmployeeId = GetAttributeValue(entry, "employeeID"),
-            Company = GetAttributeValue(entry, "company")
+            DistinguishedName = entry.DistinguishedName,
+            SamAccountName = GetAttr(entry, "sAMAccountName"),
+            UserPrincipalName = GetAttr(entry, "userPrincipalName"),
+            DisplayName = GetAttr(entry, "displayName"),
+            FirstName = GetAttr(entry, "givenName"),
+            LastName = GetAttr(entry, "sn"),
+            Email = GetAttr(entry, "mail"),
+            Department = GetAttr(entry, "department"),
+            Title = GetAttr(entry, "title"),
+            Office = GetAttr(entry, "physicalDeliveryOfficeName"),
+            Phone = GetAttr(entry, "telephoneNumber"),
+            Mobile = GetAttr(entry, "mobile"),
+            Manager = GetAttr(entry, "manager"),
+            EmployeeId = GetAttr(entry, "employeeID"),
+            Company = GetAttr(entry, "company")
         };
 
-        var uacValue = GetAttributeValue(entry, "userAccountControl");
+        var uacValue = GetAttr(entry, "userAccountControl");
         if (int.TryParse(uacValue, out var uac))
         {
             const int accountDisabled = 0x0002;
             userInfo.IsEnabled = (uac & accountDisabled) == 0;
         }
 
-        var lockoutTime = GetAttributeValue(entry, "lockoutTime");
+        var lockoutTime = GetAttr(entry, "lockoutTime");
         userInfo.IsLocked = !string.IsNullOrEmpty(lockoutTime) && lockoutTime != "0";
 
-        var memberOf = entry.GetAttribute("memberOf");
+        var memberOf = entry.Attributes["memberOf"];
         if (memberOf != null)
         {
-            foreach (var groupDn in memberOf.StringValueArray)
+            foreach (string groupDn in memberOf.GetValues(typeof(string)))
             {
                 var groupName = ExtractCnFromDn(groupDn);
                 if (!string.IsNullOrEmpty(groupName))
@@ -548,24 +471,25 @@ public class LdapService : ILdapService
             }
         }
 
-        userInfo.WhenCreated = ParseLdapTimestamp(GetAttributeValue(entry, "whenCreated"));
-        userInfo.WhenChanged = ParseLdapTimestamp(GetAttributeValue(entry, "whenChanged"));
-        userInfo.LastLogon = ParseFileTime(GetAttributeValue(entry, "lastLogonTimestamp"));
+        userInfo.WhenCreated = ParseLdapTimestamp(GetAttr(entry, "whenCreated"));
+        userInfo.WhenChanged = ParseLdapTimestamp(GetAttr(entry, "whenChanged"));
+        userInfo.LastLogon = ParseFileTime(GetAttr(entry, "lastLogonTimestamp"));
 
         return userInfo;
     }
 
-    private static string GetAttributeValue(LdapEntry entry, string attributeName)
+    private static string GetAttr(SearchResultEntry entry, string name)
     {
         try
         {
-            var attribute = entry.GetAttribute(attributeName);
-            return attribute?.StringValue ?? string.Empty;
+            var attr = entry.Attributes[name];
+            if (attr != null && attr.Count > 0)
+            {
+                return attr[0]?.ToString() ?? string.Empty;
+            }
         }
-        catch
-        {
-            return string.Empty;
-        }
+        catch { }
+        return string.Empty;
     }
 
     private static string ExtractCnFromDn(string dn)
@@ -575,10 +499,7 @@ public class LdapService : ILdapService
         if (dn.StartsWith("CN=", StringComparison.OrdinalIgnoreCase))
         {
             var commaIndex = dn.IndexOf(',');
-            if (commaIndex > 3)
-            {
-                return dn.Substring(3, commaIndex - 3);
-            }
+            if (commaIndex > 3) return dn.Substring(3, commaIndex - 3);
         }
 
         return dn;
@@ -602,19 +523,16 @@ public class LdapService : ILdapService
 
         try
         {
-            var year = int.Parse(timestamp.Substring(0, 4));
-            var month = int.Parse(timestamp.Substring(4, 2));
-            var day = int.Parse(timestamp.Substring(6, 2));
-            var hour = int.Parse(timestamp.Substring(8, 2));
-            var minute = int.Parse(timestamp.Substring(10, 2));
-            var second = int.Parse(timestamp.Substring(12, 2));
-
-            return new DateTime(year, month, day, hour, minute, second, DateTimeKind.Utc);
+            return new DateTime(
+                int.Parse(timestamp.Substring(0, 4)),
+                int.Parse(timestamp.Substring(4, 2)),
+                int.Parse(timestamp.Substring(6, 2)),
+                int.Parse(timestamp.Substring(8, 2)),
+                int.Parse(timestamp.Substring(10, 2)),
+                int.Parse(timestamp.Substring(12, 2)),
+                DateTimeKind.Utc);
         }
-        catch
-        {
-            return null;
-        }
+        catch { return null; }
     }
 
     private static DateTime? ParseFileTime(string fileTimeString)
@@ -623,14 +541,8 @@ public class LdapService : ILdapService
 
         if (long.TryParse(fileTimeString, out var fileTime) && fileTime > 0)
         {
-            try
-            {
-                return DateTime.FromFileTimeUtc(fileTime);
-            }
-            catch
-            {
-                return null;
-            }
+            try { return DateTime.FromFileTimeUtc(fileTime); }
+            catch { return null; }
         }
 
         return null;
