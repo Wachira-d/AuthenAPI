@@ -203,7 +203,7 @@ public sealed class AdminAuthService
         }
 
         // 2. Active Directory
-        var auth = await _ldap.AuthenticateWithResultAsync(username, password);
+        var auth = await _ldap.AuthenticateWithResultAsync(username, password, allowServiceAccount: true);
         if (!auth.Success || auth.User == null)
         {
             if (auth.FailureReason is AuthFailureReason.ServerUnavailable or AuthFailureReason.Error)

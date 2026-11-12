@@ -16,7 +16,7 @@ public interface ILdapService
     /// <summary>
     /// Authenticate a user and report why it failed (bad password, locked, disabled, DC unreachable...)
     /// </summary>
-    Task<LdapAuthResult> AuthenticateWithResultAsync(string username, string password);
+    Task<LdapAuthResult> AuthenticateWithResultAsync(string username, string password, bool allowServiceAccount = false);
 
     /// <summary>
     /// Quick check: can the service account bind?

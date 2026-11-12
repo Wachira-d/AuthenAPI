@@ -75,7 +75,7 @@ public partial class LdapService : ILdapService
     }
 
     /// <inheritdoc />
-    public async Task<LdapAuthResult> AuthenticateWithResultAsync(string username, string password)
+    public async Task<LdapAuthResult> AuthenticateWithResultAsync(string username, string password, bool allowServiceAccount = false)
     {
         if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
         {
@@ -87,7 +87,7 @@ public partial class LdapService : ILdapService
         await ConnectionLock.WaitAsync();
         try
         {
-            var result = await Task.Run(() => AuthenticateCore(username.Trim(), password));
+            var result = await Task.Run(() => AuthenticateCore(username.Trim(), password, allowServiceAccount));
             result.DurationMs = stopwatch.ElapsedMilliseconds;
 
             if (result.Success)
@@ -367,7 +367,7 @@ public partial class LdapService : ILdapService
 
     #region Authentication core
 
-    private LdapAuthResult AuthenticateCore(string username, string password)
+    private LdapAuthResult AuthenticateCore(string username, string password, bool allowServiceAccount)
     {
         var s = _settings;
         _logger.LogInformation("=== Starting Authentication for: {Username} ({Format}) ===",
@@ -375,7 +375,8 @@ public partial class LdapService : ILdapService
 
         // The service account is not a user login: refusing it here also stops anyone holding an
         // API key from locking it out (which would force every login onto the fallback path).
-        if (!string.IsNullOrEmpty(s.ServiceAccountUsername) &&
+        // The admin portal may allow it (it has its own lockout), e.g. when an admin's own account is the service account.
+        if (!allowServiceAccount && !string.IsNullOrEmpty(s.ServiceAccountUsername) &&
             ExtractSamAccountName(username).Equals(ExtractSamAccountName(s.ServiceAccountUsername), StringComparison.OrdinalIgnoreCase))
         {
             return LdapAuthResult.Fail(AuthFailureReason.InvalidCredentials, "The service account cannot be used to sign in");
