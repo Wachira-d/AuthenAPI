@@ -239,6 +239,12 @@ Key และ settings ที่แก้บนเครื่องหนึ่
 
 ## Troubleshooting
 
+### Error: HTTP 405 เมื่อกดบันทึกในหน้า Admin (PUT/DELETE)
+
+โมดูล WebDAV ของ IIS บล็อก PUT/DELETE ซึ่ง `web.config` ของโปรเจกต์ปิด WebDAV ไว้ให้แล้ว ถ้ายังเกิดปัญหา ให้ถอนการติดตั้ง WebDAV:
+Server Manager → Remove Roles and Features → Web Server (IIS) → Common HTTP Features → **WebDAV Publishing**
+หรือรัน PowerShell: `Uninstall-WindowsFeature Web-DAV-Publishing` แล้วตามด้วย `iisreset`
+
 ### Error: HTTP 403.14 - Forbidden
 
 **สาเหตุ:** IIS ไม่รู้จัก ASP.NET Core Module
