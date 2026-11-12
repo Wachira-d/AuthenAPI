@@ -1,9 +1,11 @@
+using AuthenAPI.Data;
 using AuthenAPI.Middleware;
 using AuthenAPI.Models;
 using AuthenAPI.Services;
 using AuthenAPI.Utilities;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Microsoft.OpenApi.Models;
 using System.Text.Json.Serialization;
@@ -22,6 +24,9 @@ if (args.Length > 0 && args[0].Equals("hash-password", StringComparison.OrdinalI
 }
 
 var builder = WebApplication.CreateBuilder(args);
+
+// EF Core logs every SQL command at Information level; keep only warnings and errors.
+builder.Logging.AddFilter("Microsoft.EntityFrameworkCore", LogLevel.Warning);
 
 // ---------------------------------------------------------------------------
 // Data directory (API keys, runtime settings, Data Protection keys)
@@ -68,6 +73,22 @@ builder.Services.AddSingleton<IOptionsChangeTokenSource<LdapSettings>, RuntimeOv
 builder.Services.AddSingleton<IOptionsChangeTokenSource<SecuritySettings>, RuntimeOverridesChangeTokenSource<SecuritySettings>>();
 builder.Services.AddSingleton<IOptionsChangeTokenSource<AuditSettings>, RuntimeOverridesChangeTokenSource<AuditSettings>>();
 builder.Services.AddSingleton<IOptionsChangeTokenSource<AdminSettings>, RuntimeOverridesChangeTokenSource<AdminSettings>>();
+
+// ---------------------------------------------------------------------------
+// Optional SQL Server storage (ConnectionStrings:AuthenAPI). Without it, files in App_Data / logs are used.
+// ---------------------------------------------------------------------------
+var connectionString = builder.Configuration.GetConnectionString("AuthenAPI");
+if (!string.IsNullOrWhiteSpace(connectionString))
+{
+    builder.Services.AddDbContextFactory<AuthenDbContext>(o => o.UseSqlServer(connectionString, sql =>
+    {
+        sql.CommandTimeout(30);
+        sql.EnableRetryOnFailure(maxRetryCount: 2, maxRetryDelay: TimeSpan.FromSeconds(3), errorNumbersToAdd: null);
+    }));
+}
+builder.Services.AddSingleton<Database>();
+builder.Services.AddSingleton<DatabaseLogWriter>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<DatabaseLogWriter>());
 
 // ---------------------------------------------------------------------------
 // Application services
@@ -168,6 +189,9 @@ builder.Services.AddSwaggerGen(c =>
 
 var app = builder.Build();
 
+// Create/upgrade database tables before any store loads its data (keys, settings).
+app.Services.GetRequiredService<Database>().Initialize();
+
 // ---------------------------------------------------------------------------
 // HTTP pipeline
 // ---------------------------------------------------------------------------
@@ -221,6 +245,23 @@ app.UseApiKeyAuth();
 
 app.UseAuthentication();
 app.UseAdminCsrfProtection();
+
+// A database outage while saving a key or setting must give the admin a clear message, not a bare 500.
+app.Use(async (context, next) =>
+{
+    try
+    {
+        await next();
+    }
+    catch (Exception ex) when (context.IsAdminPath() && !context.Response.HasStarted &&
+                               (ex is DbUpdateException || ex.GetBaseException() is Microsoft.Data.SqlClient.SqlException))
+    {
+        context.RequestServices.GetRequiredService<ILogger<Database>>().LogError(ex, "Database error on {Path}", context.Request.Path);
+        context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+        await context.Response.WriteAsJsonAsync(ApiResponse.Fail("Database is unavailable. The change was not saved.",
+            ex.GetBaseException().Message));
+    }
+});
 app.UseAuthorization();
 
 app.MapControllers();

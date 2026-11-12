@@ -1,4 +1,6 @@
+using AuthenAPI.Data;
 using AuthenAPI.Models;
+using Microsoft.EntityFrameworkCore;
 using AuthenAPI.Utilities;
 using Microsoft.Extensions.Options;
 using System.Text.Json;
@@ -15,6 +17,9 @@ public sealed class RequestLogService : BackgroundService
     private const int Capacity = 50_000;
     private static readonly JsonSerializerOptions FileJson = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
+    private const int MaxMetricRows = 500_000;
+    private readonly Database _database;
+    private readonly DatabaseLogWriter _dbWriter;
     private readonly IOptionsMonitor<AuditSettings> _auditSettings;
     private readonly IWebHostEnvironment _environment;
     private readonly ILogger<RequestLogService> _logger;
@@ -27,8 +32,11 @@ public sealed class RequestLogService : BackgroundService
     private int _count;
     private DateTime _lastPurge = DateTime.MinValue;
 
-    public RequestLogService(IOptionsMonitor<AuditSettings> auditSettings, IWebHostEnvironment environment, ILogger<RequestLogService> logger)
+    public RequestLogService(Database database, DatabaseLogWriter dbWriter, IOptionsMonitor<AuditSettings> auditSettings,
+        IWebHostEnvironment environment, ILogger<RequestLogService> logger)
     {
+        _database = database;
+        _dbWriter = dbWriter;
         _auditSettings = auditSettings;
         _environment = environment;
         _logger = logger;
@@ -55,6 +63,28 @@ public sealed class RequestLogService : BackgroundService
         }
 
         _writeQueue.Writer.TryWrite(entry);
+        _dbWriter.Enqueue(entry);
+    }
+
+    /// <summary>Run a database read; on failure fall back to the in-memory copy</summary>
+    private T FromDatabaseOr<T>(Func<AuthenDbContext, T> read, Func<T> fallback)
+    {
+        if (!_database.Enabled) return fallback();
+        try
+        {
+            using var db = _database.CreateContext();
+            db.Database.SetCommandTimeout(30);
+            var result = read(db);
+            _database.ReportOk();
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _database.ReportError(ex);
+            _logger.LogWarning("Request log query failed on the database, showing recent in-memory entries: {Error}",
+                ex.GetBaseException().Message);
+            return fallback();
+        }
     }
 
     /// <summary>Entries in chronological order (oldest first)</summary>
@@ -75,21 +105,35 @@ public sealed class RequestLogService : BackgroundService
 
     #region Queries
 
-    public PagedResult<RequestLogEntry> Query(RequestLogQuery q)
-    {
-        var matches = Filter(Snapshot(), q).OrderByDescending(e => e.Timestamp).ToList();
-        return new PagedResult<RequestLogEntry>
+    public PagedResult<RequestLogEntry> Query(RequestLogQuery q) => FromDatabaseOr(
+        db =>
         {
-            Total = matches.Count,
-            Items = matches.Skip(Math.Max(0, q.Skip)).Take(Math.Clamp(q.Take, 1, 500)).ToList()
-        };
-    }
+            var query = FilterDb(db.RequestLogs.AsNoTracking(), q);
+            return new PagedResult<RequestLogEntry>
+            {
+                Total = query.Count(),
+                Items = query.OrderByDescending(e => e.Timestamp).Skip(Math.Max(0, q.Skip)).Take(Math.Clamp(q.Take, 1, 500)).ToList()
+            };
+        },
+        () =>
+        {
+            var matches = Filter(Snapshot(), q).OrderByDescending(e => e.Timestamp).ToList();
+            return new PagedResult<RequestLogEntry>
+            {
+                Total = matches.Count,
+                Items = matches.Skip(Math.Max(0, q.Skip)).Take(Math.Clamp(q.Take, 1, 500)).ToList()
+            };
+        });
 
-    public RequestLogEntry? Get(string id) => Snapshot().FirstOrDefault(e => e.Id == id);
+    public RequestLogEntry? Get(string id) => FromDatabaseOr(
+        db => db.RequestLogs.AsNoTracking().FirstOrDefault(e => e.Id == id) ?? Snapshot().FirstOrDefault(e => e.Id == id),
+        () => Snapshot().FirstOrDefault(e => e.Id == id));
 
     public string ExportCsv(RequestLogQuery q)
     {
-        var rows = Filter(Snapshot(), q).OrderByDescending(e => e.Timestamp).Take(100_000);
+        var rows = FromDatabaseOr(
+            db => FilterDb(db.RequestLogs.AsNoTracking(), q).OrderByDescending(e => e.Timestamp).Take(100_000).ToList(),
+            () => Filter(Snapshot(), q).OrderByDescending(e => e.Timestamp).Take(100_000).ToList());
         return CsvWriter.Build(
             new[] { "timestamp", "method", "path", "query", "status", "durationMs", "clientIp", "apiKey", "username", "outcome", "error", "ldapStrategy", "userAgent", "traceId" },
             rows.Select(e => new object?[]
@@ -97,6 +141,46 @@ public sealed class RequestLogService : BackgroundService
                 e.Timestamp, e.Method, e.Path, e.QueryString, e.StatusCode, e.DurationMs, e.ClientIp,
                 e.ApiKeyName, e.Username, e.Outcome, e.ErrorMessage, e.LdapStrategy, e.UserAgent, e.TraceId
             }));
+    }
+
+    /// <summary>Same filters as <see cref="Filter"/>, translated to SQL (LIKE is case-insensitive with the default collation)</summary>
+    private static IQueryable<RequestLogEntry> FilterDb(IQueryable<RequestLogEntry> e, RequestLogQuery q)
+    {
+        if (q.From.HasValue) { var from = q.From.Value.ToUniversalTime(); e = e.Where(x => x.Timestamp >= from); }
+        if (q.To.HasValue) { var to = q.To.Value.ToUniversalTime(); e = e.Where(x => x.Timestamp <= to); }
+        if (!string.IsNullOrWhiteSpace(q.Method)) { var m = q.Method.Trim().ToUpperInvariant(); e = e.Where(x => x.Method == m); }
+        if (!string.IsNullOrWhiteSpace(q.Path)) e = e.Where(x => x.Path.Contains(q.Path));
+        if (!string.IsNullOrWhiteSpace(q.ApiKeyId)) e = e.Where(x => x.ApiKeyId == q.ApiKeyId);
+        if (!string.IsNullOrWhiteSpace(q.Ip)) e = e.Where(x => x.ClientIp != null && x.ClientIp.Contains(q.Ip));
+        if (!string.IsNullOrWhiteSpace(q.Username)) e = e.Where(x => x.Username != null && x.Username.Contains(q.Username));
+        if (q.MinDurationMs.HasValue) e = e.Where(x => x.DurationMs >= q.MinDurationMs.Value);
+
+        if (!string.IsNullOrWhiteSpace(q.Status))
+        {
+            var status = q.Status.Trim().ToLowerInvariant();
+            if (status.Length == 3 && status.EndsWith("xx") && char.IsDigit(status[0]))
+            {
+                var low = (status[0] - '0') * 100;
+                var high = low + 100;
+                e = e.Where(x => x.StatusCode >= low && x.StatusCode < high);
+            }
+            else if (int.TryParse(status, out var code))
+            {
+                e = e.Where(x => x.StatusCode == code);
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(q.Search))
+        {
+            var s = q.Search.Trim();
+            e = e.Where(x =>
+                x.Path.Contains(s) || (x.Username != null && x.Username.Contains(s)) || (x.ClientIp != null && x.ClientIp.Contains(s)) ||
+                (x.ApiKeyName != null && x.ApiKeyName.Contains(s)) || (x.Outcome != null && x.Outcome.Contains(s)) ||
+                (x.ErrorMessage != null && x.ErrorMessage.Contains(s)) || (x.UserAgent != null && x.UserAgent.Contains(s)) ||
+                (x.TraceId != null && x.TraceId.Contains(s)));
+        }
+
+        return e;
     }
 
     private static IEnumerable<RequestLogEntry> Filter(IEnumerable<RequestLogEntry> source, RequestLogQuery q)
@@ -152,9 +236,24 @@ public sealed class RequestLogService : BackgroundService
         var firstBucket = new DateTime(((to - span).Ticks / bucket.Ticks + 1) * bucket.Ticks, DateTimeKind.Utc);
         var from = firstBucket;
 
-        var entries = Snapshot().Where(e => e.Timestamp >= from && e.Timestamp <= to);
-        if (!string.IsNullOrWhiteSpace(apiKeyId)) entries = entries.Where(e => e.ApiKeyId == apiKeyId);
-        var list = entries.ToList();
+        var list = FromDatabaseOr(
+            db =>
+            {
+                var q = db.RequestLogs.AsNoTracking().Where(e => e.Timestamp >= from && e.Timestamp <= to);
+                if (!string.IsNullOrWhiteSpace(apiKeyId)) q = q.Where(e => e.ApiKeyId == apiKeyId);
+                // Only the columns metrics need.
+                return q.OrderByDescending(e => e.Timestamp).Take(MaxMetricRows).Select(e => new RequestLogEntry
+                {
+                    Timestamp = e.Timestamp, Method = e.Method, Path = e.Path, StatusCode = e.StatusCode, DurationMs = e.DurationMs,
+                    ApiKeyId = e.ApiKeyId, ApiKeyName = e.ApiKeyName, ClientIp = e.ClientIp, Username = e.Username
+                }).ToList();
+            },
+            () =>
+            {
+                var entries = Snapshot().Where(e => e.Timestamp >= from && e.Timestamp <= to);
+                if (!string.IsNullOrWhiteSpace(apiKeyId)) entries = entries.Where(e => e.ApiKeyId == apiKeyId);
+                return entries.ToList();
+            });
 
         var durations = list.Select(e => e.DurationMs).OrderBy(d => d).ToList();
         var auth = list.Where(IsAuthCall).ToList();
@@ -361,6 +460,23 @@ public sealed class RequestLogService : BackgroundService
     {
         if (DateTime.UtcNow - _lastPurge < TimeSpan.FromHours(6)) return;
         _lastPurge = DateTime.UtcNow;
+
+        if (_database.Enabled)
+        {
+            try
+            {
+                var dbCutoff = DateTime.UtcNow.AddDays(-Math.Max(1, _auditSettings.CurrentValue.RequestLogRetentionDays));
+                using var db = _database.CreateContext();
+                db.Database.SetCommandTimeout(300);
+                var deleted = db.RequestLogs.Where(e => e.Timestamp < dbCutoff).ExecuteDelete();
+                if (deleted > 0) _logger.LogInformation("Purged {Count} request log rows older than {Cutoff:u}", deleted, dbCutoff);
+            }
+            catch (Exception ex)
+            {
+                _database.ReportError(ex);
+                _logger.LogWarning("Failed to purge old request logs from the database: {Error}", ex.GetBaseException().Message);
+            }
+        }
 
         try
         {

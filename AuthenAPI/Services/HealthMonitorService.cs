@@ -1,3 +1,4 @@
+using AuthenAPI.Data;
 using AuthenAPI.Models;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Options;
@@ -26,6 +27,8 @@ public sealed class HealthMonitorService : BackgroundService
     private readonly LdapStrategyCache _strategyCache;
     private readonly RequestLogService _requestLog;
     private readonly DataPaths _paths;
+    private readonly Database _database;
+    private (bool Ok, long LatencyMs, string? Error)? _lastDbPing;
     private readonly IMemoryCache _cache;
     private readonly IWebHostEnvironment _environment;
     private readonly ILogger<HealthMonitorService> _logger;
@@ -51,6 +54,7 @@ public sealed class HealthMonitorService : BackgroundService
         LdapStrategyCache strategyCache,
         RequestLogService requestLog,
         DataPaths paths,
+        Database database,
         IMemoryCache cache,
         IWebHostEnvironment environment,
         ILogger<HealthMonitorService> logger)
@@ -60,6 +64,7 @@ public sealed class HealthMonitorService : BackgroundService
         _strategyCache = strategyCache;
         _requestLog = requestLog;
         _paths = paths;
+        _database = database;
         _cache = cache;
         _environment = environment;
         _logger = logger;
@@ -118,6 +123,7 @@ public sealed class HealthMonitorService : BackgroundService
             }
 
             _lastPorts = await portsTask;
+            if (_database.Enabled) _lastDbPing = await _database.PingAsync(cancellationToken);
             _lastProbe = probe;
             _lastProbeAt = DateTime.UtcNow;
 
@@ -293,6 +299,34 @@ public sealed class HealthMonitorService : BackgroundService
         if (report.Ldap.Ports.Count > 0 && !anyPortOpen)
         {
             checks.Add(new HealthCheckItem { Name = "LDAP network", Status = HealthState.Unhealthy, Message = "No LDAP port is reachable on any configured DC" });
+        }
+
+        if (_database.Enabled)
+        {
+            var ping = _lastDbPing;
+            checks.Add(new HealthCheckItem
+            {
+                Name = "Database",
+                Status = ping == null ? HealthState.Degraded
+                    : !ping.Value.Ok ? HealthState.Unhealthy
+                    : !_database.SchemaReady ? HealthState.Degraded
+                    : HealthState.Healthy,
+                Message = ping == null ? $"{_database.Server} / {_database.DatabaseName}: not checked yet"
+                    : ping.Value.Ok
+                        ? (_database.SchemaReady
+                            ? $"{_database.Server} / {_database.DatabaseName} reachable in {ping.Value.LatencyMs} ms"
+                            : $"{_database.Server} / {_database.DatabaseName} reachable, but tables could not be created: {_database.LastError}")
+                        : $"{_database.Server} / {_database.DatabaseName} unreachable: {ping.Value.Error}. API keys and settings are served from the local cache; logs are queued."
+            });
+        }
+        else
+        {
+            checks.Add(new HealthCheckItem
+            {
+                Name = "Database",
+                Status = HealthState.Healthy,
+                Message = "Not configured: data is stored in files (App_Data, logs). Set ConnectionStrings:AuthenAPI to use SQL Server."
+            });
         }
 
         checks.Add(new HealthCheckItem

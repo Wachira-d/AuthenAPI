@@ -1,3 +1,4 @@
+using AuthenAPI.Data;
 using AuthenAPI.Models;
 using AuthenAPI.Utilities;
 using Microsoft.Extensions.Options;
@@ -6,6 +7,7 @@ using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
 
 namespace AuthenAPI.Services;
 
@@ -20,6 +22,8 @@ public sealed class ApiKeyService : IHostedService, IDisposable
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
     private readonly DataPaths _paths;
+    private readonly Database _database;
+    private Timer? _reloadTimer;
     private readonly IOptionsMonitor<SecuritySettings> _security;
     private readonly ILogger<ApiKeyService> _logger;
     private readonly object _lock = new();
@@ -31,9 +35,10 @@ public sealed class ApiKeyService : IHostedService, IDisposable
     private Dictionary<string, ManagedApiKey> _byHash = new();
     private Timer? _flushTimer;
 
-    public ApiKeyService(DataPaths paths, IOptionsMonitor<SecuritySettings> security, ILogger<ApiKeyService> logger)
+    public ApiKeyService(DataPaths paths, Database database, IOptionsMonitor<SecuritySettings> security, ILogger<ApiKeyService> logger)
     {
         _paths = paths;
+        _database = database;
         _security = security;
         _logger = logger;
         Load();
@@ -214,9 +219,10 @@ public sealed class ApiKeyService : IHostedService, IDisposable
 
         lock (_lock)
         {
+            Persist(key);
             _byId[key.Id] = key;
             Reindex();
-            Save();
+            SaveCache();
         }
 
         return new ApiKeySecretResponse { Key = ToView(key), PlainTextKey = plain };
@@ -239,7 +245,8 @@ public sealed class ApiKeyService : IHostedService, IDisposable
             key.UpdatedBy = updatedBy;
 
             _ipMatchers.TryRemove(id, out _);
-            Save();
+            Persist(key);
+            SaveCache();
             return ToView(key);
         }
     }
@@ -256,8 +263,9 @@ public sealed class ApiKeyService : IHostedService, IDisposable
             key.UpdatedAt = DateTime.UtcNow;
             key.UpdatedBy = updatedBy;
 
+            Persist(key);
             Reindex();
-            Save();
+            SaveCache();
             return new ApiKeySecretResponse { Key = ToView(key), PlainTextKey = plain };
         }
     }
@@ -271,7 +279,8 @@ public sealed class ApiKeyService : IHostedService, IDisposable
             key.IsActive = false;
             key.RevokedAt ??= DateTime.UtcNow;
             key.RevokedBy ??= revokedBy;
-            Save();
+            Persist(key);
+            SaveCache();
             return ToView(key);
         }
     }
@@ -280,9 +289,11 @@ public sealed class ApiKeyService : IHostedService, IDisposable
     {
         lock (_lock)
         {
-            if (!_byId.Remove(id)) return false;
+            if (!_byId.ContainsKey(id)) return false;
+            PersistDelete(id);
+            _byId.Remove(id);
             Reindex();
-            Save();
+            SaveCache();
         }
 
         _usage.TryRemove(id, out _);
@@ -297,6 +308,12 @@ public sealed class ApiKeyService : IHostedService, IDisposable
 
     private void Load()
     {
+        if (_database.Enabled && TryLoadFromDatabase(importFromCache: true)) return;
+        LoadFromFile();
+    }
+
+    private void LoadFromFile()
+    {
         try
         {
             if (!File.Exists(_paths.ApiKeysFile)) return;
@@ -307,7 +324,8 @@ public sealed class ApiKeyService : IHostedService, IDisposable
                 _byId = keys.ToDictionary(k => k.Id);
                 Reindex();
             }
-            _logger.LogInformation("Loaded {Count} managed API keys from {Path}", keys.Count, _paths.ApiKeysFile);
+            _logger.LogInformation("Loaded {Count} managed API keys from {Path}{Note}", keys.Count, _paths.ApiKeysFile,
+                _database.Enabled ? " (local cache: database unavailable)" : string.Empty);
         }
         catch (Exception ex)
         {
@@ -315,14 +333,108 @@ public sealed class ApiKeyService : IHostedService, IDisposable
         }
     }
 
-    /// <summary>Caller must hold _lock</summary>
-    private void Save()
+    /// <summary>Load all keys from the database. On the first run, keys from api-keys.json are imported.</summary>
+    private bool TryLoadFromDatabase(bool importFromCache)
     {
-        ApplyPendingUsage();
-        Directory.CreateDirectory(_paths.DataDirectory);
-        var temp = _paths.ApiKeysFile + ".tmp";
-        File.WriteAllText(temp, JsonSerializer.Serialize(_byId.Values.OrderBy(k => k.CreatedAt).ToList(), JsonOptions));
-        File.Move(temp, _paths.ApiKeysFile, overwrite: true);
+        try
+        {
+            using var db = _database.CreateContext();
+            var keys = db.ApiKeys.AsNoTracking().ToList();
+
+            if (importFromCache && keys.Count == 0 && File.Exists(_paths.ApiKeysFile))
+            {
+                var fileKeys = JsonSerializer.Deserialize<List<ManagedApiKey>>(File.ReadAllText(_paths.ApiKeysFile)) ?? new();
+                if (fileKeys.Count > 0)
+                {
+                    db.ApiKeys.AddRange(fileKeys);
+                    db.SaveChanges();
+                    keys = fileKeys;
+                    _logger.LogInformation("Imported {Count} API keys from {Path} into the database", fileKeys.Count, _paths.ApiKeysFile);
+                }
+            }
+
+            lock (_lock)
+            {
+                _byId = keys.ToDictionary(k => k.Id);
+                Reindex();
+                _ipMatchers.Clear();
+                SaveCache();
+            }
+            _database.ReportOk();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _database.ReportError(ex);
+            _logger.LogWarning("Could not load API keys from the database: {Error}", ex.GetBaseException().Message);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Write one key to the database (insert or update management fields; usage counters are
+    /// updated separately so servers do not overwrite each other's counts). Throws when the database is down.
+    /// </summary>
+    private void Persist(ManagedApiKey key)
+    {
+        if (!_database.Enabled) return;
+
+        using var db = _database.CreateContext();
+        var row = db.ApiKeys.FirstOrDefault(k => k.Id == key.Id);
+        if (row == null)
+        {
+            db.ApiKeys.Add(Copy(key));
+        }
+        else
+        {
+            row.Name = key.Name;
+            row.Description = key.Description;
+            row.Prefix = key.Prefix;
+            row.KeyHash = key.KeyHash;
+            row.Scopes = key.Scopes.ToList();
+            row.AllowedIps = key.AllowedIps.ToList();
+            row.RateLimitPerMinute = key.RateLimitPerMinute;
+            row.IsActive = key.IsActive;
+            row.ExpiresAt = key.ExpiresAt;
+            row.UpdatedAt = key.UpdatedAt;
+            row.UpdatedBy = key.UpdatedBy;
+            row.RevokedAt = key.RevokedAt;
+            row.RevokedBy = key.RevokedBy;
+        }
+        db.SaveChanges();
+        _database.ReportOk();
+    }
+
+    private void PersistDelete(string id)
+    {
+        if (!_database.Enabled) return;
+
+        using var db = _database.CreateContext();
+        db.ApiKeys.Where(k => k.Id == id).ExecuteDelete();
+        _database.ReportOk();
+    }
+
+    private static ManagedApiKey Copy(ManagedApiKey k) =>
+        JsonSerializer.Deserialize<ManagedApiKey>(JsonSerializer.Serialize(k))!;
+
+    /// <summary>
+    /// Caller must hold _lock. Writes api-keys.json: the store itself in file mode, a local cache
+    /// (used when the database is unreachable at startup) in database mode.
+    /// </summary>
+    private void SaveCache()
+    {
+        try
+        {
+            if (!_database.Enabled) ApplyPendingUsage();
+            Directory.CreateDirectory(_paths.DataDirectory);
+            var temp = _paths.ApiKeysFile + ".tmp";
+            File.WriteAllText(temp, JsonSerializer.Serialize(_byId.Values.OrderBy(k => k.CreatedAt).ToList(), JsonOptions));
+            File.Move(temp, _paths.ApiKeysFile, overwrite: true);
+        }
+        catch (Exception ex) when (_database.Enabled)
+        {
+            _logger.LogWarning("Could not write local API key cache: {Error}", ex.Message);
+        }
     }
 
     /// <summary>Caller must hold _lock</summary>
@@ -350,9 +462,15 @@ public sealed class ApiKeyService : IHostedService, IDisposable
     {
         try
         {
+            if (_database.Enabled)
+            {
+                FlushUsageToDatabase();
+                return;
+            }
+
             lock (_lock)
             {
-                if (ApplyPendingUsage()) Save();
+                if (ApplyPendingUsage()) SaveCache();
             }
         }
         catch (Exception ex)
@@ -361,20 +479,66 @@ public sealed class ApiKeyService : IHostedService, IDisposable
         }
     }
 
+    /// <summary>Increment counters in place (UPDATE ... SET UsageCount = UsageCount + n) so several servers add up</summary>
+    private void FlushUsageToDatabase()
+    {
+        foreach (var (id, counter) in _usage)
+        {
+            var (delta, lastUsed, lastIp) = counter.TakePending();
+            if (delta == 0) continue;
+
+            try
+            {
+                using var db = _database.CreateContext();
+                db.ApiKeys.Where(k => k.Id == id).ExecuteUpdate(u => u
+                    .SetProperty(k => k.UsageCount, k => k.UsageCount + delta)
+                    .SetProperty(k => k.LastUsedAt, lastUsed)
+                    .SetProperty(k => k.LastUsedIp, lastIp));
+
+                lock (_lock)
+                {
+                    if (_byId.TryGetValue(id, out var key))
+                    {
+                        key.UsageCount += delta;
+                        key.LastUsedAt = lastUsed;
+                        key.LastUsedIp = lastIp;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                counter.Restore(delta);
+                _database.ReportError(ex);
+                _logger.LogWarning("Failed to write API key usage to the database: {Error}", ex.GetBaseException().Message);
+                return;
+            }
+        }
+    }
+
     public Task StartAsync(CancellationToken cancellationToken)
     {
         _flushTimer = new Timer(_ => FlushUsage(), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
+        if (_database.Enabled)
+        {
+            // Pick up keys created or changed on other servers (and recover after a database outage).
+            _reloadTimer = new Timer(_ => TryLoadFromDatabase(importFromCache: false), null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+        }
         return Task.CompletedTask;
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
     {
         _flushTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+        _reloadTimer?.Change(Timeout.Infinite, Timeout.Infinite);
         FlushUsage();
         return Task.CompletedTask;
     }
 
-    public void Dispose() => _flushTimer?.Dispose();
+    public void Dispose()
+    {
+        _flushTimer?.Dispose();
+        _reloadTimer?.Dispose();
+    }
 
     #endregion
 
@@ -444,6 +608,8 @@ public sealed class ApiKeyService : IHostedService, IDisposable
         }
 
         public long PeekPending() => Interlocked.Read(ref _pending);
+
+        public void Restore(long delta) => Interlocked.Add(ref _pending, delta);
 
         public (long Delta, DateTime? LastUsed, string? LastIp) TakePending() =>
             (Interlocked.Exchange(ref _pending, 0), LastUsedAt, LastIp);

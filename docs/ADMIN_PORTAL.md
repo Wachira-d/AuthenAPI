@@ -187,3 +187,16 @@ See section "Admin Portal" in `docs/IIS_DEPLOYMENT_GUIDE.md` (data folder permis
 7. Changing the server, port, TLS options or service account requires re-entering the service-account password. This prevents the stored password from being sent to a new host.
 5. If AD rejects the service account password, service binds pause for 15 minutes, so the health probe cannot lock the account. Saving new LDAP settings clears the pause.
 6. If the directory can't be searched, the fallback is a direct bind (`DOMAIN\user`, then `user@domain`) that stops at the first definitive answer. If no endpoint is reachable at all, Windows `PrincipalContext` gets one attempt.
+
+## 6. Storage
+
+| Data | No connection string | `ConnectionStrings:AuthenAPI` set |
+|---|---|---|
+| API keys | `App_Data/api-keys.json` | `dbo.ApiKeys`. The file is kept as a startup cache. Usage counters use atomic increments. |
+| Runtime settings | `App_Data/settings.runtime.json` plus `backups/` | `dbo.RuntimeSettings` plus `dbo.RuntimeSettingsHistory`, which keeps every version |
+| Request log | memory (50k) plus `logs/requests_*.jsonl` | `dbo.RequestLogs`, written in batches in the background. Files are still written. |
+| Audit log | memory (10k) plus `logs/audit_*.json` | `dbo.AuditLogs`. Files are still written. |
+| Data Protection keys | `App_Data/keys` | `App_Data/keys`. Never stored in the DB next to the data they protect. |
+
+- The schema is in `AuthenAPI/Data/DatabaseSchema.sql` and is copied to `docs/sql/`. It is idempotent and runs at startup.
+- Other servers pick up changes within 30 s. Retention: `AuditSettings.RetentionDays` and `RequestLogRetentionDays`, purged daily.

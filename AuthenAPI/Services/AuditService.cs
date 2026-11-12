@@ -1,4 +1,6 @@
+using AuthenAPI.Data;
 using AuthenAPI.Models;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using System.Collections.Concurrent;
 using System.Text.Json;
@@ -11,6 +13,8 @@ namespace AuthenAPI.Services;
 public class AuditService : IAuditService, IDisposable
 {
     private readonly ILogger<AuditService> _logger;
+    private readonly Database _database;
+    private readonly DatabaseLogWriter _dbWriter;
     private readonly IOptionsMonitor<AuditSettings> _settingsMonitor;
     private readonly ConcurrentQueue<AuditLog> _auditLogs;
     private readonly SemaphoreSlim _fileLock;
@@ -22,9 +26,12 @@ public class AuditService : IAuditService, IDisposable
     // Maximum logs to keep in memory
     private const int MaxInMemoryLogs = 10000;
 
-    public AuditService(ILogger<AuditService> logger, IOptionsMonitor<AuditSettings> settings, IWebHostEnvironment environment)
+    public AuditService(ILogger<AuditService> logger, IOptionsMonitor<AuditSettings> settings, IWebHostEnvironment environment,
+        Database database, DatabaseLogWriter dbWriter)
     {
         _logger = logger;
+        _database = database;
+        _dbWriter = dbWriter;
         _settingsMonitor = settings;
         _auditLogs = new ConcurrentQueue<AuditLog>();
         _fileLock = new SemaphoreSlim(1, 1);
@@ -95,6 +102,7 @@ public class AuditService : IAuditService, IDisposable
 
         // Add to in-memory queue
         _auditLogs.Enqueue(log);
+        _dbWriter.Enqueue(log);
 
         // Trim if exceeds max
         while (_auditLogs.Count > MaxInMemoryLogs)
@@ -129,8 +137,50 @@ public class AuditService : IAuditService, IDisposable
         await LogAsync(log);
     }
 
+    private static IQueryable<AuditLog> FilterDb(IQueryable<AuditLog> logs, AuditLogQuery query)
+    {
+        if (!string.IsNullOrEmpty(query.Username)) logs = logs.Where(l => l.Username != null && l.Username.Contains(query.Username));
+        if (query.Action.HasValue) { var action = query.Action.Value; logs = logs.Where(l => l.Action == action); }
+        if (query.Success.HasValue) { var success = query.Success.Value; logs = logs.Where(l => l.Success == success); }
+        if (query.FromDate.HasValue) { var from = query.FromDate.Value.ToUniversalTime(); logs = logs.Where(l => l.Timestamp >= from); }
+        if (query.ToDate.HasValue) { var to = query.ToDate.Value.ToUniversalTime(); logs = logs.Where(l => l.Timestamp <= to); }
+        if (!string.IsNullOrEmpty(query.IpAddress)) logs = logs.Where(l => l.IpAddress != null && l.IpAddress.Contains(query.IpAddress));
+        return logs;
+    }
+
+    /// <summary>Query the database; null when it is not configured or not reachable (callers use memory)</summary>
+    private async Task<PagedResult<AuditLog>?> QueryDatabaseAsync(AuditLogQuery query)
+    {
+        if (!_database.Enabled) return null;
+        try
+        {
+            await using var db = _database.CreateContext();
+            var q = FilterDb(db.AuditLogs.AsNoTracking(), query);
+            var result = new PagedResult<AuditLog>
+            {
+                Total = await q.CountAsync(),
+                Items = await q.OrderByDescending(l => l.Timestamp)
+                    .Skip(Math.Max(0, query.Skip)).Take(Math.Clamp(query.MaxResults, 1, 500)).ToListAsync()
+            };
+            _database.ReportOk();
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _database.ReportError(ex);
+            _logger.LogWarning("Audit query failed on the database, showing recent in-memory entries: {Error}", ex.GetBaseException().Message);
+            return null;
+        }
+    }
+
     /// <inheritdoc />
-    public Task<List<AuditLog>> QueryAsync(AuditLogQuery query)
+    public async Task<List<AuditLog>> QueryAsync(AuditLogQuery query)
+    {
+        var fromDb = await QueryDatabaseAsync(query);
+        return fromDb?.Items ?? await QueryMemoryAsync(query);
+    }
+
+    private Task<List<AuditLog>> QueryMemoryAsync(AuditLogQuery query)
     {
         var logs = _auditLogs.ToList().AsQueryable();
 
@@ -177,7 +227,10 @@ public class AuditService : IAuditService, IDisposable
     }
 
     /// <inheritdoc />
-    public Task<PagedResult<AuditLog>> QueryPagedAsync(AuditLogQuery query)
+    public async Task<PagedResult<AuditLog>> QueryPagedAsync(AuditLogQuery query) =>
+        await QueryDatabaseAsync(query) ?? await QueryPagedMemoryAsync(query);
+
+    private Task<PagedResult<AuditLog>> QueryPagedMemoryAsync(AuditLogQuery query)
     {
         IEnumerable<AuditLog> logs = _auditLogs.ToList();
 
@@ -278,6 +331,22 @@ public class AuditService : IAuditService, IDisposable
         }
 
         var purgedCount = initialCount - _auditLogs.Count;
+
+        if (_database.Enabled)
+        {
+            try
+            {
+                using var db = _database.CreateContext();
+                db.Database.SetCommandTimeout(300);
+                var deleted = db.AuditLogs.Where(l => l.Timestamp < cutoff).ExecuteDelete();
+                purgedCount = Math.Max(purgedCount, deleted);
+            }
+            catch (Exception ex)
+            {
+                _database.ReportError(ex);
+                _logger.LogWarning("Failed to purge old audit rows from the database: {Error}", ex.GetBaseException().Message);
+            }
+        }
         _logger.LogInformation("Purged {Count} old audit logs (older than {Days} days)", purgedCount, olderThanDays);
 
         return Task.FromResult(purgedCount);

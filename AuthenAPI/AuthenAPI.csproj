@@ -7,9 +7,14 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="8.0.11" />
     <PackageReference Include="System.DirectoryServices.AccountManagement" Version="8.0.1" />
     <PackageReference Include="System.DirectoryServices.Protocols" Version="8.0.1" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Data\DatabaseSchema.sql" LogicalName="AuthenAPI.Data.DatabaseSchema.sql" />
   </ItemGroup>
 
 </Project>

@@ -1,8 +1,10 @@
+using AuthenAPI.Data;
 using AuthenAPI.Models;
 using AuthenAPI.Utilities;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Primitives;
+using Microsoft.EntityFrameworkCore;
 using System.Text.Json;
 
 namespace AuthenAPI.Services;
@@ -48,6 +50,9 @@ public sealed class RuntimeSettingsStore
     private const int MaxBackups = 20;
 
     private readonly DataPaths _paths;
+    private readonly Database _database;
+    private readonly Timer? _pollTimer;
+    private int _version;
     private readonly IDataProtector _protector;
     private readonly ILogger<RuntimeSettingsStore> _logger;
     private readonly object _lock = new();
@@ -55,13 +60,22 @@ public sealed class RuntimeSettingsStore
     private string? _ldapPassword;
     private CancellationTokenSource _changeSource = new();
 
-    public RuntimeSettingsStore(DataPaths paths, IDataProtectionProvider dataProtection, ILogger<RuntimeSettingsStore> logger)
+    public RuntimeSettingsStore(DataPaths paths, Database database, IDataProtectionProvider dataProtection, ILogger<RuntimeSettingsStore> logger)
     {
         _paths = paths;
+        _database = database;
         _protector = dataProtection.CreateProtector("AuthenAPI.RuntimeSettings.v1");
         _logger = logger;
         Load();
+
+        if (_database.Enabled)
+        {
+            // Apply changes saved on other servers (and recover if the database was down at startup).
+            _pollTimer = new Timer(_ => PollDatabase(), null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+        }
     }
+
+    public bool UsesDatabase => _database.Enabled;
 
     public RuntimeOverrides Current => _current;
 
@@ -88,17 +102,144 @@ public sealed class RuntimeSettingsStore
             copy.UpdatedAt = DateTime.UtcNow;
             copy.UpdatedBy = updatedBy;
 
-            Save(copy);
+            if (_database.Enabled)
+            {
+                _version = SaveToDatabase(copy, updatedBy);
+                SaveCacheFile(copy);
+            }
+            else
+            {
+                Save(copy);
+            }
             _current = copy;
             _ldapPassword = Unprotect(copy.LdapPasswordProtected);
         }
 
+        NotifyChanged();
+    }
+
+    private void NotifyChanged()
+    {
         var previous = Interlocked.Exchange(ref _changeSource, new CancellationTokenSource());
         previous.Cancel();
         previous.Dispose();
     }
 
     private void Load()
+    {
+        if (_database.Enabled && TryLoadFromDatabase(importFile: true)) return;
+        LoadFromFile();
+    }
+
+    private bool TryLoadFromDatabase(bool importFile)
+    {
+        try
+        {
+            using var db = _database.CreateContext();
+            var row = db.RuntimeSettings.AsNoTracking().FirstOrDefault(r => r.Id == 1);
+
+            if (row == null)
+            {
+                if (importFile && File.Exists(_paths.RuntimeSettingsFile))
+                {
+                    var fromFile = JsonSerializer.Deserialize<RuntimeOverrides>(File.ReadAllText(_paths.RuntimeSettingsFile)) ?? new();
+                    lock (_lock)
+                    {
+                        _version = SaveToDatabase(fromFile, fromFile.UpdatedBy ?? "import");
+                        _current = fromFile;
+                        _ldapPassword = Unprotect(fromFile.LdapPasswordProtected);
+                    }
+                    _logger.LogInformation("Imported runtime settings from {Path} into the database", _paths.RuntimeSettingsFile);
+                }
+                _database.ReportOk();
+                return true;
+            }
+
+            var loaded = JsonSerializer.Deserialize<RuntimeOverrides>(row.Json) ?? new();
+            lock (_lock)
+            {
+                _current = loaded;
+                _version = row.Version;
+                _ldapPassword = Unprotect(loaded.LdapPasswordProtected);
+                SaveCacheFile(loaded);
+            }
+            _database.ReportOk();
+            _logger.LogInformation("Loaded runtime settings v{Version} from the database (last change {UpdatedAt} by {UpdatedBy})",
+                row.Version, row.UpdatedAt, row.UpdatedBy);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _database.ReportError(ex);
+            _logger.LogWarning("Could not load runtime settings from the database ({Error}); using the local copy",
+                ex.GetBaseException().Message);
+            return false;
+        }
+    }
+
+    private void PollDatabase()
+    {
+        try
+        {
+            using var db = _database.CreateContext();
+            var version = db.RuntimeSettings.Where(r => r.Id == 1).Select(r => (int?)r.Version).FirstOrDefault();
+            if (version.HasValue && version.Value != _version && TryLoadFromDatabase(importFile: false))
+            {
+                _logger.LogInformation("Runtime settings changed on another server; applied v{Version}", version);
+                NotifyChanged();
+            }
+        }
+        catch (Exception ex)
+        {
+            _database.ReportError(ex);
+        }
+    }
+
+    /// <summary>Upsert the single settings row and append a history entry; returns the new version</summary>
+    private int SaveToDatabase(RuntimeOverrides overrides, string updatedBy)
+    {
+        using var db = _database.CreateContext();
+        var json = JsonSerializer.Serialize(overrides);
+        var row = db.RuntimeSettings.FirstOrDefault(r => r.Id == 1);
+        if (row == null)
+        {
+            row = new RuntimeSettingsRow { Id = 1, Version = 0 };
+            db.RuntimeSettings.Add(row);
+        }
+
+        row.Version++;
+        row.Json = json;
+        row.UpdatedAt = DateTime.UtcNow;
+        row.UpdatedBy = updatedBy;
+        db.RuntimeSettingsHistory.Add(new RuntimeSettingsHistoryRow
+        {
+            Version = row.Version,
+            Json = json,
+            ChangedAt = row.UpdatedAt,
+            ChangedBy = updatedBy
+        });
+        db.SaveChanges();
+        _database.ReportOk();
+        return row.Version;
+    }
+
+    /// <summary>Local copy used when the database cannot be reached at startup</summary>
+    private void SaveCacheFile(RuntimeOverrides overrides)
+    {
+        try
+        {
+            Directory.CreateDirectory(_paths.DataDirectory);
+            var temp = _paths.RuntimeSettingsFile + ".tmp";
+            File.WriteAllText(temp, JsonSerializer.Serialize(overrides, JsonOptions));
+            File.Move(temp, _paths.RuntimeSettingsFile, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Could not write local settings cache: {Error}", ex.Message);
+        }
+    }
+
+    private void LoadFromFile()
     {
         try
         {

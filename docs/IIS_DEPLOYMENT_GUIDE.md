@@ -186,6 +186,57 @@ AuthenAPI.exe hash-password
 
 ---
 
+## SQL Server (เก็บ API keys, settings และ logs ใน database)
+
+ถ้าไม่ตั้งค่า ระบบจะเก็บข้อมูลเป็นไฟล์ใน `App_Data` และ `logs` เหมือนเดิม
+
+### 1. สร้าง database และ SQL login (ให้ DBA รัน)
+
+```sql
+CREATE DATABASE AuthenAPI;
+GO
+CREATE LOGIN authenapi_app WITH PASSWORD = 'รหัสผ่านที่แข็งแรง';
+GO
+USE AuthenAPI;
+CREATE USER authenapi_app FOR LOGIN authenapi_app;
+ALTER ROLE db_datareader ADD MEMBER authenapi_app;
+ALTER ROLE db_datawriter ADD MEMBER authenapi_app;
+ALTER ROLE db_ddladmin  ADD MEMBER authenapi_app;   -- ให้ระบบสร้างตารางเองตอนเริ่มทำงาน
+```
+
+ถ้าไม่ต้องการให้สิทธิ์ `db_ddladmin` ให้ DBA รัน `docs/sql/AuthenAPI-schema.sql` เองครั้งเดียว แล้วให้แค่ `db_datareader` และ `db_datawriter` (script รันซ้ำได้ ไม่ทำลายข้อมูล)
+
+### 2. ใส่ connection string ใน `appsettings.json` บน server
+
+```json
+"ConnectionStrings": {
+  "AuthenAPI": "Server=SQLSERVER01;Database=AuthenAPI;User Id=authenapi_app;Password=xxx;TrustServerCertificate=True"
+}
+```
+
+- `TrustServerCertificate=True` จำเป็นถ้า SQL Server ใช้ certificate ที่ web server ไม่ trust (ค่าปกติของ SQL Server ภายในองค์กร) ถ้ามี certificate ที่ trust แล้ว ให้ใช้ `Encrypt=True` แทน
+- ใช้ named instance ได้ เช่น `Server=SQLSERVER01\\SQLEXPRESS` หรือระบุ port `Server=10.1.2.3,1433`
+- web server ต้องต่อ SQL Server ได้ (port 1433) ทดสอบด้วย `Test-NetConnection SQLSERVER01 -Port 1433`
+
+### 3. `iisreset` แล้วตรวจ log
+
+ต้องเห็น `Database storage ready: ...` ครั้งแรกระบบจะ import API keys และ settings จาก `App_Data` เข้า database ให้อัตโนมัติ
+ดูสถานะได้ที่หน้า Admin → Dashboard → Health checks → **Database**
+
+### ถ้า database ล่ม
+
+- Login ผ่าน API ยังทำงานได้ (API keys อยู่ใน memory และมีสำเนาใน `App_Data\\api-keys.json`)
+- การสร้าง/แก้ key และ settings จะถูกปฏิเสธ (503) จนกว่า database จะกลับมา
+- Log ถูกเก็บในคิวและในไฟล์ `logs\\` แล้วเขียนลง database เมื่อกลับมา
+- หน้า Request/Audit Logs จะแสดงเฉพาะข้อมูลล่าสุดใน memory ระหว่างนั้น
+
+### หลาย web server ใช้ database เดียวกัน
+
+Key และ settings ที่แก้บนเครื่องหนึ่ง จะมีผลกับเครื่องอื่นภายใน 30 วินาที
+**ต้อง copy โฟลเดอร์ `App_Data\\keys` ให้เหมือนกันทุกเครื่อง** ไม่อย่างนั้น admin session จะใช้ข้ามเครื่องไม่ได้ และรหัสผ่าน service account ที่บันทึกผ่านหน้าเว็บจะถอดรหัสบนเครื่องอื่นไม่ได้
+
+---
+
 ## Troubleshooting
 
 ### Error: HTTP 403.14 - Forbidden
