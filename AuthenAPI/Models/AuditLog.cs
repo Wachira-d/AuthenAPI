@@ -109,7 +109,18 @@ public enum AuditAction
     /// <summary>
     /// API Key authentication attempt
     /// </summary>
-    ApiKeyAuth
+    ApiKeyAuth,
+
+    // Admin portal actions. Append only: audit files store these as numbers.
+    AdminLogin,
+    AdminLogout,
+    ApiKeyCreated,
+    ApiKeyUpdated,
+    ApiKeyRotated,
+    ApiKeyRevoked,
+    ApiKeyDeleted,
+    SettingsChanged,
+    AdminTool
 }
 
 /// <summary>

@@ -8,51 +8,59 @@ namespace AuthenAPI.Services;
 public interface ILdapService
 {
     /// <summary>
-    /// Authenticate a user against Active Directory
+    /// Authenticate a user. Accepts sAMAccountName, DOMAIN\user, UPN or email.
     /// </summary>
-    /// <param name="username">Username (sAMAccountName or UPN)</param>
-    /// <param name="password">Password</param>
-    /// <returns>UserInfo if authentication successful, null otherwise</returns>
+    /// <returns>UserInfo if authentication succeeded, null otherwise</returns>
     Task<UserInfo?> AuthenticateAsync(string username, string password);
 
     /// <summary>
-    /// Test connection to Active Directory server
+    /// Authenticate a user and report why it failed (bad password, locked, disabled, DC unreachable...)
     /// </summary>
-    /// <returns>True if connection successful</returns>
+    Task<LdapAuthResult> AuthenticateWithResultAsync(string username, string password);
+
+    /// <summary>
+    /// Quick check: can the service account bind?
+    /// </summary>
     Task<bool> TestConnectionAsync();
 
     /// <summary>
-    /// Test connection with detailed diagnostics trying multiple strategies
+    /// Bind as the service account once using the preferred strategy.
+    /// With <paramref name="reevaluate"/> the most secure strategies are tried first again.
     /// </summary>
-    /// <returns>Detailed test result with all strategies tried</returns>
+    Task<LdapProbeResult> ProbeAsync(bool reevaluate = false, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Try every connection strategy and report which ones work (slow)
+    /// </summary>
     Task<ConnectionTestResult> TestConnectionDetailedAsync();
+
+    /// <summary>
+    /// Test candidate settings (bind + Base DN) without saving them
+    /// </summary>
+    Task<LdapTestResult> TestSettingsAsync(LdapSettings candidate);
 
     /// <summary>
     /// Get user information by username
     /// </summary>
-    /// <param name="username">Username (sAMAccountName or UPN)</param>
-    /// <returns>UserInfo if found, null otherwise</returns>
     Task<UserInfo?> GetUserAsync(string username);
 
     /// <summary>
     /// Search users in Active Directory
     /// </summary>
-    /// <param name="request">Search request parameters</param>
-    /// <returns>List of matching users</returns>
     Task<List<UserInfo>> SearchUsersAsync(SearchRequest request);
 
     /// <summary>
-    /// Get all groups for a user
+    /// Get the direct group memberships of a user
     /// </summary>
-    /// <param name="username">Username</param>
-    /// <returns>List of group names</returns>
     Task<List<string>> GetUserGroupsAsync(string username);
 
     /// <summary>
-    /// Check if user is member of a specific group
+    /// Check if user is a direct member of a group
     /// </summary>
-    /// <param name="username">Username</param>
-    /// <param name="groupName">Group name</param>
-    /// <returns>True if user is member of the group</returns>
     Task<bool> IsUserInGroupAsync(string username, string groupName);
+
+    /// <summary>
+    /// Drop all cached users and groups
+    /// </summary>
+    void ClearCache();
 }

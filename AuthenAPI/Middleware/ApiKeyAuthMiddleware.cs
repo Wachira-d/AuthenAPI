@@ -1,122 +1,98 @@
 using AuthenAPI.Models;
 using AuthenAPI.Services;
+using AuthenAPI.Utilities;
 using Microsoft.Extensions.Options;
 
 namespace AuthenAPI.Middleware;
 
 /// <summary>
-/// Middleware to authenticate requests using API keys
+/// Requires a valid API key for the public API and enforces per-key scopes, IP restrictions,
+/// expiry and rate limits. The admin portal (/admin, /api/admin) uses cookie authentication instead.
 /// </summary>
 public class ApiKeyAuthMiddleware
 {
     private readonly RequestDelegate _next;
     private readonly ILogger<ApiKeyAuthMiddleware> _logger;
-    private readonly SecuritySettings _settings;
+    private readonly IOptionsMonitor<SecuritySettings> _settings;
 
     public ApiKeyAuthMiddleware(
         RequestDelegate next,
         ILogger<ApiKeyAuthMiddleware> logger,
-        IOptions<SecuritySettings> settings)
+        IOptionsMonitor<SecuritySettings> settings)
     {
         _next = next;
         _logger = logger;
-        _settings = settings.Value;
+        _settings = settings;
     }
 
-    public async Task InvokeAsync(HttpContext context, IAuditService auditService)
+    public async Task InvokeAsync(HttpContext context, ApiKeyService apiKeys, IAuditService auditService)
     {
-        if (!_settings.EnableApiKeyAuth)
+        var settings = _settings.CurrentValue;
+        var path = context.Request.Path.Value ?? string.Empty;
+
+        if (!settings.EnableApiKeyAuth ||
+            context.IsAdminPath() ||
+            settings.ExcludedPaths.Any(p => path.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
         {
             await _next(context);
             return;
         }
 
-        // Check if path is excluded
-        var path = context.Request.Path.Value?.ToLowerInvariant() ?? "";
-        if (_settings.ExcludedPaths.Any(p => path.StartsWith(p.ToLowerInvariant())))
+        context.Request.Headers.TryGetValue(settings.ApiKeyHeaderName, out var header);
+        var scope = ApiKeyScopes.Resolve(context.Request.Method, path);
+        var result = apiKeys.Validate(header.ToString(), context.GetClientIp(), scope);
+
+        if (result.Success)
         {
+            context.Items[RequestLogItems.ApiKeyId] = result.KeyId;
+            context.Items[RequestLogItems.ApiKeyName] = result.KeyName;
+            context.Items["ApiKeyDescription"] = result.KeyName; // kept for older code paths
             await _next(context);
             return;
         }
 
-        // Get API key from header
-        if (!context.Request.Headers.TryGetValue(_settings.ApiKeyHeaderName, out var apiKeyHeader))
+        var (status, message) = result.Failure switch
         {
-            _logger.LogWarning("API request rejected: Missing API key header from {RemoteIp}",
-                context.Connection.RemoteIpAddress);
+            ApiKeyFailure.Missing => (StatusCodes.Status401Unauthorized, $"API key is required in the '{settings.ApiKeyHeaderName}' header"),
+            ApiKeyFailure.Expired => (StatusCodes.Status401Unauthorized, "API key has expired"),
+            ApiKeyFailure.Disabled or ApiKeyFailure.Revoked => (StatusCodes.Status401Unauthorized, "API key is not active"),
+            ApiKeyFailure.IpDenied => (StatusCodes.Status403Forbidden, "API key is not allowed from this IP address"),
+            ApiKeyFailure.ScopeDenied => (StatusCodes.Status403Forbidden, $"API key does not have the '{scope}' scope"),
+            ApiKeyFailure.RateLimited => (StatusCodes.Status429TooManyRequests, "API key rate limit exceeded"),
+            _ => (StatusCodes.Status401Unauthorized, "Invalid API key")
+        };
 
+        context.Items[RequestLogItems.ApiKeyId] = result.KeyId;
+        context.Items[RequestLogItems.ApiKeyName] = result.KeyName;
+        context.SetRequestOutcome($"ApiKey:{result.Failure}", message);
+
+        _logger.LogWarning("API request rejected ({Failure}) for {Path} from {RemoteIp}, key: {Key}",
+            result.Failure, path, context.GetClientIpString(), result.KeyName ?? "-");
+
+        // Missing/invalid keys are recorded in the request log; only notable key misuse goes to the audit trail.
+        if (result.Failure is not (ApiKeyFailure.Missing or ApiKeyFailure.Invalid or ApiKeyFailure.RateLimited))
+        {
             await auditService.LogAsync(new AuditLog
             {
                 Action = AuditAction.ApiKeyAuth,
-                Username = "Anonymous",
+                Username = result.KeyName ?? "Anonymous",
                 Success = false,
-                IpAddress = context.Connection.RemoteIpAddress?.ToString() ?? "Unknown",
-                Details = "Missing API key header",
-                RequestPath = context.Request.Path
+                IpAddress = context.GetClientIpString(),
+                UserAgent = context.Request.Headers.UserAgent.ToString(),
+                RequestPath = path,
+                HttpMethod = context.Request.Method,
+                StatusCode = status,
+                Details = $"{result.Failure}: {message}"
             });
-
-            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-            await context.Response.WriteAsJsonAsync(new
-            {
-                error = "API key is required",
-                message = $"Please provide API key in the '{_settings.ApiKeyHeaderName}' header"
-            });
-            return;
         }
 
-        var apiKey = apiKeyHeader.ToString();
-
-        // Validate API key
-        var keyConfig = _settings.ApiKeys.FirstOrDefault(k =>
-            k.Key == apiKey && k.IsActive);
-
-        if (keyConfig == null)
+        if (result.RetryAfterSeconds.HasValue)
         {
-            _logger.LogWarning("API request rejected: Invalid API key from {RemoteIp}",
-                context.Connection.RemoteIpAddress);
-
-            await auditService.LogAsync(new AuditLog
-            {
-                Action = AuditAction.ApiKeyAuth,
-                Username = "Anonymous",
-                Success = false,
-                IpAddress = context.Connection.RemoteIpAddress?.ToString() ?? "Unknown",
-                Details = "Invalid API key",
-                RequestPath = context.Request.Path
-            });
-
-            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-            await context.Response.WriteAsJsonAsync(new { error = "Invalid API key" });
-            return;
+            context.Response.Headers["Retry-After"] = result.RetryAfterSeconds.Value.ToString();
         }
 
-        // Check expiration
-        if (keyConfig.ExpiresAt.HasValue && keyConfig.ExpiresAt.Value < DateTime.UtcNow)
-        {
-            _logger.LogWarning("API request rejected: Expired API key '{Description}' from {RemoteIp}",
-                keyConfig.Description, context.Connection.RemoteIpAddress);
-
-            await auditService.LogAsync(new AuditLog
-            {
-                Action = AuditAction.ApiKeyAuth,
-                Username = keyConfig.Description,
-                Success = false,
-                IpAddress = context.Connection.RemoteIpAddress?.ToString() ?? "Unknown",
-                Details = "API key expired",
-                RequestPath = context.Request.Path
-            });
-
-            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-            await context.Response.WriteAsJsonAsync(new { error = "API key has expired" });
-            return;
-        }
-
-        // Add key info to context for logging
-        context.Items["ApiKeyDescription"] = keyConfig.Description;
-
-        _logger.LogDebug("API request authenticated with key: {Description}", keyConfig.Description);
-
-        await _next(context);
+        context.Response.StatusCode = status;
+        await context.Response.WriteAsJsonAsync(new { error = message, reason = result.Failure.ToString() });
     }
 }
 

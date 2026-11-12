@@ -1,5 +1,6 @@
 using AuthenAPI.Models;
 using AuthenAPI.Services;
+using AuthenAPI.Utilities;
 using Microsoft.AspNetCore.Mvc;
 using System.Diagnostics;
 
@@ -136,13 +137,16 @@ public class LdapController : ControllerBase
         }
 
         _logger.LogInformation("Authentication attempt for user: {Username}", request.Username);
+        HttpContext.Items[RequestLogItems.Username] = request.Username;
 
-        var userInfo = await _ldapService.AuthenticateAsync(request.Username, request.Password);
+        var result = await _ldapService.AuthenticateWithResultAsync(request.Username, request.Password);
         stopwatch.Stop();
+        HttpContext.Items[RequestLogItems.LdapStrategy] = result.Strategy;
 
-        if (userInfo != null)
+        if (result.Success && result.User != null)
         {
-            _logger.LogInformation("User authenticated successfully: {Username}", request.Username);
+            var userInfo = result.User;
+            HttpContext.Items[RequestLogItems.Outcome] = "Success";
 
             await _auditService.LogAsync(new AuditLog
             {
@@ -155,17 +159,21 @@ public class LdapController : ControllerBase
                 HttpMethod = Request.Method,
                 DurationMs = stopwatch.ElapsedMilliseconds,
                 StatusCode = 200,
-                Details = $"User authenticated. Groups: {userInfo.Groups.Count}"
+                Details = $"User authenticated via {result.Method} ({result.Strategy}). Groups: {userInfo.Groups.Count}"
             });
 
             return Ok(ApiResponse<UserInfo>.Ok(userInfo, "Authentication successful"));
         }
 
-        _logger.LogWarning("Authentication failed for user: {Username}", request.Username);
+        var directoryDown = result.FailureReason is AuthFailureReason.ServerUnavailable or AuthFailureReason.Error;
+        var statusCode = directoryDown ? StatusCodes.Status503ServiceUnavailable : StatusCodes.Status401Unauthorized;
+        HttpContext.Items[RequestLogItems.Outcome] = $"AuthFailed:{result.FailureReason}";
+        HttpContext.Items[RequestLogItems.Error] = result.Message;
 
         // Check for brute force attempts
         var failedAttempts = await _auditService.GetRecentFailedLoginCountAsync(request.Username);
-        var details = $"Invalid credentials. Failed attempts in last 15 min: {failedAttempts + 1}";
+        var details = $"{result.FailureReason} via {result.Method ?? "-"} ({result.Strategy ?? "-"}): {result.Message}. " +
+                      $"Failed attempts in last 15 min: {failedAttempts + 1}";
 
         await _auditService.LogAsync(new AuditLog
         {
@@ -177,10 +185,17 @@ public class LdapController : ControllerBase
             RequestPath = Request.Path,
             HttpMethod = Request.Method,
             DurationMs = stopwatch.ElapsedMilliseconds,
-            StatusCode = 401,
+            StatusCode = statusCode,
             Details = details
         });
 
+        if (directoryDown)
+        {
+            return StatusCode(statusCode,
+                ApiResponse.Fail("Authentication service is temporarily unavailable (directory unreachable). Please try again later."));
+        }
+
+        // Same message for wrong password, unknown user, locked, disabled...: callers must not learn which.
         return Unauthorized(ApiResponse.Fail("Authentication failed. Invalid username or password."));
     }
 
@@ -439,14 +454,8 @@ public class LdapController : ControllerBase
 
     private string? GetClientIpAddress()
     {
-        // Check for forwarded IP (behind proxy/load balancer)
-        var forwardedFor = Request.Headers["X-Forwarded-For"].FirstOrDefault();
-        if (!string.IsNullOrEmpty(forwardedFor))
-        {
-            return forwardedFor.Split(',').FirstOrDefault()?.Trim();
-        }
-
-        return HttpContext.Connection.RemoteIpAddress?.ToString();
+        // RemoteIpAddress is already the real client behind IIS; a raw X-Forwarded-For header can be forged.
+        return HttpContext.GetClientIpString();
     }
 
     private string? GetUserAgent()

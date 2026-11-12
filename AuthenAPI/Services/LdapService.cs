@@ -1,22 +1,32 @@
 using AuthenAPI.Models;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Options;
+using System.Diagnostics;
 using System.DirectoryServices.AccountManagement;
 using System.DirectoryServices.Protocols;
 using System.Net;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.RegularExpressions;
 
 namespace AuthenAPI.Services;
 
 /// <summary>
-/// LDAP service implementation using System.DirectoryServices.Protocols
-/// for Active Directory operations via LDAPS with caching
+/// Active Directory access over LDAP / LDAPS.
+///
+/// Authentication flow (designed so a wrong password costs AD exactly one bad-password count):
+///   1. Bind as the service account (cached working strategy first) and look the user up
+///      by sAMAccountName / userPrincipalName / mail.
+///   2. Bind once as the user with the directory's own UPN (or DN).
+///   3. Only if the directory cannot be searched, fall back to direct binds with a few
+///      username formats, stopping at the first definitive answer from AD.
+///   4. Only if every LDAP endpoint is unreachable, try Windows PrincipalContext once.
 /// </summary>
-public class LdapService : ILdapService
+public partial class LdapService : ILdapService
 {
-    private readonly LdapSettings _settings;
-    private readonly ILogger<LdapService> _logger;
-    private readonly IMemoryCache _cache;
-    private readonly SemaphoreSlim _connectionLock = new(10, 10);
+    private static readonly SemaphoreSlim ConnectionLock = new(20, 20);
+    private static readonly TimeSpan SearchTimeout = TimeSpan.FromSeconds(5);
 
     private const string UserCachePrefix = "ldap_user_";
     private const string GroupsCachePrefix = "ldap_groups_";
@@ -31,334 +41,170 @@ public class LdapService : ILdapService
         "whenCreated", "whenChanged", "lastLogonTimestamp"
     };
 
-    private static readonly string[] AuthAttributes =
+    private static readonly string[] SearchAttributes =
     {
         "distinguishedName", "sAMAccountName", "userPrincipalName",
         "displayName", "mail", "department", "memberOf",
         "userAccountControl", "lockoutTime"
     };
 
-    public LdapService(IOptions<LdapSettings> settings, ILogger<LdapService> logger, IMemoryCache cache)
+    private readonly LdapSettings _settings;
+    private readonly ILogger<LdapService> _logger;
+    private readonly IMemoryCache _cache;
+    private readonly LdapStrategyCache _strategyCache;
+
+    public LdapService(
+        IOptionsSnapshot<LdapSettings> settings,
+        ILogger<LdapService> logger,
+        IMemoryCache cache,
+        LdapStrategyCache strategyCache)
     {
         _settings = settings.Value;
         _logger = logger;
         _cache = cache;
+        _strategyCache = strategyCache;
     }
+
+    #region Public API
 
     /// <inheritdoc />
     public async Task<UserInfo?> AuthenticateAsync(string username, string password)
     {
+        var result = await AuthenticateWithResultAsync(username, password);
+        return result.Success ? result.User : null;
+    }
+
+    /// <inheritdoc />
+    public async Task<LdapAuthResult> AuthenticateWithResultAsync(string username, string password)
+    {
         if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
         {
-            _logger.LogWarning("Authentication attempt with empty username or password");
-            return null;
+            // An empty password would be an "unauthenticated bind", which AD reports as success.
+            return LdapAuthResult.Fail(AuthFailureReason.InvalidCredentials, "Username and password are required");
         }
 
-        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-
+        var stopwatch = Stopwatch.StartNew();
+        await ConnectionLock.WaitAsync();
         try
         {
-            await _connectionLock.WaitAsync();
+            var result = await Task.Run(() => AuthenticateCore(username.Trim(), password));
+            result.DurationMs = stopwatch.ElapsedMilliseconds;
 
-            return await Task.Run(() =>
+            if (result.Success)
             {
-                try
-                {
-                    _logger.LogInformation("=== Starting Authentication for: {Username} ===", username);
+                _logger.LogInformation(
+                    "=== Authentication succeeded for {Username} via {Method} ({Strategy}) in {Ms}ms ===",
+                    username, result.Method, result.Strategy, result.DurationMs);
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "=== Authentication failed for {Username}: {Reason} ({Message}) in {Ms}ms ===",
+                    username, result.FailureReason, result.Message, result.DurationMs);
+            }
 
-                    // Detect input format
-                    var inputFormat = DetectUsernameFormat(username);
-                    _logger.LogInformation("Input format detected: {Format}", inputFormat);
-
-                    // Step 1: Authenticate user credentials using combined fallback approach
-                    _logger.LogDebug("Step 1: Authenticating user credentials (with fallback methods)...");
-                    var (authSuccess, authMethod, usernameUsed) = AuthenticateWithFallback(username, password);
-
-                    if (!authSuccess)
-                    {
-                        _logger.LogWarning("All authentication methods failed for user: {Username}", username);
-                        return null;
-                    }
-
-                    _logger.LogInformation("✓ User authenticated successfully: {Username} using method: {Method} (format: {Format})",
-                        username, authMethod, usernameUsed);
-
-                    // Extract SAM from the username used for search
-                    string searchIdentifier = ExtractSamAccountName(usernameUsed ?? username);
-                    _logger.LogInformation("Search identifier (SAM): {SAM}", searchIdentifier);
-
-                    // Prepare basic user info (return immediately if search fails/timeout)
-                    var basicUserInfo = new UserInfo
-                    {
-                        SamAccountName = searchIdentifier,
-                        UserPrincipalName = usernameUsed,
-                        DisplayName = searchIdentifier,
-                        Email = username.Contains("@") ? username : null,
-                        IsEnabled = true
-                    };
-
-                    // Step 2: Try to get user details with service account (with timeout)
-                    _logger.LogInformation("Step 2: Fetching user details (timeout: 10s)...");
-
-                    try
-                    {
-                        var searchTask = Task.Run(() =>
-                        {
-                            _logger.LogInformation("Connecting with service account...");
-                            var svcResult = TryMultipleConnectionStrategies(
-                                _settings.ServiceAccountUsername,
-                                _settings.ServiceAccountPassword);
-
-                            _logger.LogInformation("Service account connection result: {Success}", svcResult.Success);
-
-                            if (svcResult.Success && svcResult.Connection != null)
-                            {
-                                using (svcResult.Connection)
-                                {
-                                    _logger.LogInformation("Searching for user: {SAM}", searchIdentifier);
-                                    return SearchUser(svcResult.Connection, searchIdentifier);
-                                }
-                            }
-                            return null;
-                        });
-
-                        // Wait max 10 seconds for user details
-                        _logger.LogInformation("Waiting for search task (max 10s)...");
-                        if (searchTask.Wait(TimeSpan.FromSeconds(10)))
-                        {
-                            var result = searchTask.Result;
-                            if (result != null)
-                            {
-                                if (_settings.EnableCache)
-                                {
-                                    CacheUserInfo(searchIdentifier, result);
-                                    if (!string.IsNullOrEmpty(result.Email) &&
-                                        !result.Email.Equals(searchIdentifier, StringComparison.OrdinalIgnoreCase))
-                                    {
-                                        CacheUserInfo(result.Email, result);
-                                    }
-                                }
-
-                                _logger.LogInformation("=== Authentication completed with full details for: {Username} in {Ms}ms ===",
-                                    username, stopwatch.ElapsedMilliseconds);
-                                return result;
-                            }
-
-                            _logger.LogWarning("User authenticated but details not found. Returning basic info.");
-                        }
-                        else
-                        {
-                            _logger.LogWarning("User details search timed out (10s). Returning basic info.");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "Failed to fetch user details. Returning basic info.");
-                    }
-
-                    // Return basic info - authentication was successful
-                    _logger.LogInformation("=== Authentication completed (basic info) for: {Username} in {Ms}ms ===",
-                        username, stopwatch.ElapsedMilliseconds);
-                    return basicUserInfo;
-                }
-                catch (LdapException ex) when (ex.ErrorCode == 49)
-                {
-                    _logger.LogWarning("Invalid credentials for user: {Username}", username);
-                    return null;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error during authentication for user: {Username}", username);
-                    return null;
-                }
-            });
+            return result;
         }
         finally
         {
-            _connectionLock.Release();
-            stopwatch.Stop();
-            _logger.LogDebug("Authentication completed in {Ms}ms", stopwatch.ElapsedMilliseconds);
+            ConnectionLock.Release();
         }
     }
 
     /// <inheritdoc />
-    public async Task<bool> TestConnectionAsync()
-    {
-        var result = await TestConnectionDetailedAsync();
-        return result.Success;
-    }
+    public async Task<bool> TestConnectionAsync() => (await ProbeAsync()).Ok;
 
-    /// <summary>
-    /// Test connection with detailed diagnostics trying multiple strategies
-    /// </summary>
-    public async Task<ConnectionTestResult> TestConnectionDetailedAsync()
+    /// <inheritdoc />
+    public async Task<LdapProbeResult> ProbeAsync(bool reevaluate = false, CancellationToken cancellationToken = default)
     {
-        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-        var testResult = new ConnectionTestResult
-        {
-            Server = _settings.Server,
-            ConfiguredPort = _settings.Port,
-            TestStartTime = DateTime.UtcNow
-        };
-
+        await ConnectionLock.WaitAsync(cancellationToken);
         try
         {
-            await _connectionLock.WaitAsync();
-
             return await Task.Run(() =>
             {
-                _logger.LogInformation("=== Starting LDAP Connection Diagnostics ===");
-                _logger.LogInformation("Target Server: {Server}", _settings.Server);
-                _logger.LogInformation("Configured Port: {Port}", _settings.Port);
-                _logger.LogInformation("Use SSL: {UseSSL}", _settings.UseSSL);
-                _logger.LogInformation("Service Account: {Account}", _settings.ServiceAccountUsername);
+                var sw = Stopwatch.StartNew();
+                var outcome = ConnectServiceAccount(_settings, honorBackoff: true, recordStats: true, ignorePreferred: reevaluate);
+                outcome.Connection?.Dispose();
 
-                var strategies = BuildConnectionStrategies();
-                _logger.LogInformation("Testing {Count} connection strategies...", strategies.Count);
-
-                foreach (var strategy in strategies)
+                return new LdapProbeResult
                 {
-                    var attemptResult = new ConnectionAttemptResult
-                    {
-                        StrategyName = strategy.Name,
-                        Server = strategy.Server,
-                        Port = strategy.Port,
-                        UseSSL = strategy.UseSSL,
-                        AuthType = strategy.AuthType.ToString()
-                    };
+                    Ok = outcome.Success,
+                    Strategy = outcome.Strategy?.Name,
+                    Secure = outcome.Strategy?.Secure ?? false,
+                    LatencyMs = sw.ElapsedMilliseconds,
+                    Error = outcome.Success ? null : outcome.ErrorMessage,
+                    FailureReason = outcome.FailureReason
+                };
+            }, cancellationToken);
+        }
+        finally
+        {
+            ConnectionLock.Release();
+        }
+    }
 
+    /// <inheritdoc />
+    public async Task<LdapTestResult> TestSettingsAsync(LdapSettings candidate)
+    {
+        await ConnectionLock.WaitAsync();
+        try
+        {
+            return await Task.Run(() =>
+            {
+                var sw = Stopwatch.StartNew();
+                var attempts = new List<LdapAttempt>();
+                var outcome = ConnectServiceAccount(candidate, honorBackoff: false, recordStats: false,
+                    ignorePreferred: true, attempts: attempts);
+
+                var result = new LdapTestResult { Attempts = attempts };
+                if (!outcome.Success)
+                {
+                    result.Success = false;
+                    result.Error = outcome.ErrorMessage;
+                    result.LatencyMs = sw.ElapsedMilliseconds;
+                    return result;
+                }
+
+                using (outcome.Connection)
+                {
+                    // Bind worked; make sure the Base DN exists too.
                     try
                     {
-                        var formattedUsername = strategy.UsernameFormatter(
-                            _settings.ServiceAccountUsername, _settings.Domain);
-                        attemptResult.UsernameFormat = formattedUsername;
-
-                        var attemptStopwatch = System.Diagnostics.Stopwatch.StartNew();
-
-                        using var connection = CreateConnectionWithStrategy(
-                            formattedUsername,
-                            _settings.ServiceAccountPassword,
-                            strategy);
-
-                        attemptStopwatch.Stop();
-                        attemptResult.Success = true;
-                        attemptResult.ResponseTimeMs = attemptStopwatch.ElapsedMilliseconds;
-
-                        _logger.LogInformation(
-                            "✓ SUCCESS: {Strategy} | Server: {Server}:{Port} | SSL: {SSL} | User: {User} | Time: {Time}ms",
-                            strategy.Name, strategy.Server, strategy.Port, strategy.UseSSL,
-                            formattedUsername, attemptStopwatch.ElapsedMilliseconds);
-
-                        testResult.SuccessfulStrategies.Add(attemptResult);
-
-                        // First success - record as recommended
-                        if (testResult.RecommendedStrategy == null)
-                        {
-                            testResult.RecommendedStrategy = attemptResult;
-                            testResult.Success = true;
-                        }
-
-                        connection.Dispose();
-                    }
-                    catch (LdapException ex)
-                    {
-                        attemptResult.Success = false;
-                        attemptResult.ErrorCode = ex.ErrorCode;
-                        attemptResult.ErrorMessage = $"LDAP Error {ex.ErrorCode}: {GetLdapErrorDescription(ex.ErrorCode)} - {ex.Message}";
-
-                        _logger.LogDebug("✗ FAILED: {Strategy} | Error: {Error}",
-                            strategy.Name, attemptResult.ErrorMessage);
-
-                        testResult.FailedStrategies.Add(attemptResult);
+                        var request = new System.DirectoryServices.Protocols.SearchRequest(
+                            candidate.BaseDN, "(objectClass=*)", SearchScope.Base, "distinguishedName");
+                        outcome.Connection!.SendRequest(request, SearchTimeout);
+                        result.Success = true;
                     }
                     catch (Exception ex)
                     {
-                        attemptResult.Success = false;
-                        attemptResult.ErrorMessage = $"{ex.GetType().Name}: {ex.Message}";
-
-                        _logger.LogDebug("✗ FAILED: {Strategy} | Error: {Error}",
-                            strategy.Name, attemptResult.ErrorMessage);
-
-                        testResult.FailedStrategies.Add(attemptResult);
+                        result.Success = false;
+                        result.Error = $"Service account bind succeeded, but Base DN '{candidate.BaseDN}' could not be read: {ex.Message}";
                     }
                 }
 
-                stopwatch.Stop();
-                testResult.TotalTestTimeMs = stopwatch.ElapsedMilliseconds;
-
-                // Log summary
-                _logger.LogInformation("=== Connection Test Summary ===");
-                _logger.LogInformation("Total strategies tested: {Total}", strategies.Count);
-                _logger.LogInformation("Successful: {Success}", testResult.SuccessfulStrategies.Count);
-                _logger.LogInformation("Failed: {Failed}", testResult.FailedStrategies.Count);
-                _logger.LogInformation("Total test time: {Time}ms", testResult.TotalTestTimeMs);
-
-                if (testResult.RecommendedStrategy != null)
-                {
-                    _logger.LogInformation("*** RECOMMENDED STRATEGY: {Strategy} ***",
-                        testResult.RecommendedStrategy.StrategyName);
-                    _logger.LogInformation("    Server: {Server}:{Port}",
-                        testResult.RecommendedStrategy.Server, testResult.RecommendedStrategy.Port);
-                    _logger.LogInformation("    SSL: {SSL}", testResult.RecommendedStrategy.UseSSL);
-                    _logger.LogInformation("    Username Format: {Format}", testResult.RecommendedStrategy.UsernameFormat);
-                }
-                else
-                {
-                    _logger.LogError("*** NO WORKING STRATEGY FOUND ***");
-
-                    // Log most common errors
-                    var errorGroups = testResult.FailedStrategies
-                        .Where(f => f.ErrorCode.HasValue)
-                        .GroupBy(f => f.ErrorCode)
-                        .OrderByDescending(g => g.Count());
-
-                    foreach (var group in errorGroups.Take(3))
-                    {
-                        _logger.LogError("Common Error Code {Code}: {Description} ({Count} occurrences)",
-                            group.Key, GetLdapErrorDescription(group.Key ?? 0), group.Count());
-                    }
-                }
-
-                return testResult;
+                result.Strategy = outcome.Strategy?.Name;
+                result.LatencyMs = sw.ElapsedMilliseconds;
+                return result;
             });
         }
         finally
         {
-            _connectionLock.Release();
+            ConnectionLock.Release();
         }
     }
 
-    /// <summary>
-    /// Get human-readable LDAP error description
-    /// </summary>
-    private static string GetLdapErrorDescription(int errorCode)
+    /// <inheritdoc />
+    public async Task<ConnectionTestResult> TestConnectionDetailedAsync()
     {
-        return errorCode switch
+        await ConnectionLock.WaitAsync();
+        try
         {
-            0 => "Success",
-            1 => "Operations Error",
-            2 => "Protocol Error",
-            3 => "Time Limit Exceeded",
-            4 => "Size Limit Exceeded",
-            7 => "Authentication Method Not Supported",
-            8 => "Strong Auth Required",
-            32 => "No Such Object (Invalid BaseDN or User not found)",
-            34 => "Invalid DN Syntax",
-            48 => "Inappropriate Authentication",
-            49 => "Invalid Credentials (Wrong username/password)",
-            50 => "Insufficient Access Rights",
-            51 => "Server Busy",
-            52 => "Server Unavailable",
-            53 => "Unwilling To Perform",
-            65 => "Object Class Violation",
-            81 => "Server Down / Cannot Connect",
-            82 => "Local Error",
-            83 => "Encoding Error",
-            84 => "Decoding Error",
-            85 => "Connection Timeout",
-            91 => "Connect Error (Network issue or SSL handshake failed)",
-            _ => $"Unknown Error ({errorCode})"
-        };
+            return await Task.Run(RunDiagnostics);
+        }
+        finally
+        {
+            ConnectionLock.Release();
+        }
     }
 
     /// <inheritdoc />
@@ -369,83 +215,68 @@ public class LdapService : ILdapService
         var cacheKey = $"{UserCachePrefix}{username.ToLowerInvariant()}";
         if (_settings.EnableCache && _cache.TryGetValue(cacheKey, out UserInfo? cachedUser))
         {
-            _logger.LogDebug("User info retrieved from cache: {Username}", username);
             return cachedUser;
         }
 
+        await ConnectionLock.WaitAsync();
         try
         {
-            await _connectionLock.WaitAsync();
-
             return await Task.Run(() =>
             {
-                try
+                var service = ConnectServiceAccount(_settings, honorBackoff: true, recordStats: true);
+                if (!service.Success)
                 {
-                    var connResult = TryMultipleConnectionStrategies(
-                        _settings.ServiceAccountUsername,
-                        _settings.ServiceAccountPassword);
+                    _logger.LogError("Cannot look up {Username}: {Error}", username, service.ErrorMessage);
+                    return null;
+                }
 
-                    if (!connResult.Success || connResult.Connection == null)
+                using (service.Connection)
+                {
+                    try
                     {
-                        _logger.LogError("Failed to connect for GetUser: {Errors}", connResult.ErrorMessage);
+                        var user = SearchUser(service.Connection!, _settings, username, out _);
+                        if (user != null) CacheUserInfo(username, user);
+                        return user;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error getting user: {Username}", username);
                         return null;
                     }
-
-                    using (connResult.Connection)
-                    {
-                        var userInfo = SearchUser(connResult.Connection, username);
-
-                        if (userInfo != null && _settings.EnableCache)
-                        {
-                            CacheUserInfo(username, userInfo);
-                        }
-
-                        return userInfo;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error getting user: {Username}", username);
-                    return null;
                 }
             });
         }
         finally
         {
-            _connectionLock.Release();
+            ConnectionLock.Release();
         }
     }
 
     /// <inheritdoc />
     public async Task<List<UserInfo>> SearchUsersAsync(Models.SearchRequest request)
     {
+        await ConnectionLock.WaitAsync();
         try
         {
-            await _connectionLock.WaitAsync();
-
             return await Task.Run(() =>
             {
                 var users = new List<UserInfo>();
-
-                try
+                var service = ConnectServiceAccount(_settings, honorBackoff: true, recordStats: true);
+                if (!service.Success)
                 {
-                    var connResult = TryMultipleConnectionStrategies(
-                        _settings.ServiceAccountUsername,
-                        _settings.ServiceAccountPassword);
+                    _logger.LogError("Cannot search users: {Error}", service.ErrorMessage);
+                    return users;
+                }
 
-                    if (!connResult.Success || connResult.Connection == null)
-                    {
-                        _logger.LogError("Failed to connect for SearchUsers: {Errors}", connResult.ErrorMessage);
-                        return users;
-                    }
-
-                    using (connResult.Connection)
+                using (service.Connection)
+                {
+                    try
                     {
                         string filter;
                         if (!string.IsNullOrEmpty(request.Query))
                         {
-                            var escaped = EscapeLdapFilter(request.Query);
-                            filter = $"(&(objectClass=user)(objectCategory=person)(|(displayName=*{escaped}*)(sAMAccountName=*{escaped}*)(mail=*{escaped}*)(givenName=*{escaped}*)(sn=*{escaped}*)))";
+                            var q = EscapeLdapFilter(request.Query);
+                            filter = $"(&(objectClass=user)(objectCategory=person)(|(displayName=*{q}*)(sAMAccountName=*{q}*)(mail=*{q}*)(givenName=*{q}*)(sn=*{q}*)))";
                         }
                         else
                         {
@@ -453,27 +284,32 @@ public class LdapService : ILdapService
                         }
 
                         var searchRequest = new System.DirectoryServices.Protocols.SearchRequest(
-                            _settings.BaseDN,
-                            filter,
-                            SearchScope.Subtree,
-                            AuthAttributes);
-                        searchRequest.SizeLimit = request.MaxResults;
-                        searchRequest.TimeLimit = TimeSpan.FromSeconds(_settings.ConnectionTimeout);
+                            _settings.BaseDN, filter, SearchScope.Subtree, SearchAttributes)
+                        {
+                            SizeLimit = request.MaxResults,
+                            TimeLimit = TimeSpan.FromSeconds(Math.Max(1, _settings.ConnectionTimeout))
+                        };
 
-                        var response = (SearchResponse)connResult.Connection.SendRequest(searchRequest);
-
+                        var response = (SearchResponse)service.Connection!.SendRequest(searchRequest, SearchTimeout);
                         foreach (SearchResultEntry entry in response.Entries)
                         {
                             users.Add(MapEntryToUserInfo(entry));
                             if (users.Count >= request.MaxResults) break;
                         }
-
-                        _logger.LogInformation("Search returned {Count} users", users.Count);
                     }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error searching users with query: {Query}", request.Query);
+                    catch (DirectoryOperationException ex) when (ex.Response is SearchResponse partial)
+                    {
+                        // Size limit exceeded: return what we have.
+                        foreach (SearchResultEntry entry in partial.Entries)
+                        {
+                            if (users.Count >= request.MaxResults) break;
+                            users.Add(MapEntryToUserInfo(entry));
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error searching users with query: {Query}", request.Query);
+                    }
                 }
 
                 return users;
@@ -481,7 +317,7 @@ public class LdapService : ILdapService
         }
         finally
         {
-            _connectionLock.Release();
+            ConnectionLock.Release();
         }
     }
 
@@ -493,434 +329,882 @@ public class LdapService : ILdapService
         var cacheKey = $"{GroupsCachePrefix}{username.ToLowerInvariant()}";
         if (_settings.EnableCache && _cache.TryGetValue(cacheKey, out List<string>? cachedGroups))
         {
-            _logger.LogDebug("User groups retrieved from cache: {Username}", username);
             return cachedGroups ?? new List<string>();
         }
 
-        try
+        var user = await GetUserAsync(username);
+        var groups = user?.Groups.ToList() ?? new List<string>();
+
+        if (user != null && _settings.EnableCache)
         {
-            await _connectionLock.WaitAsync();
-
-            return await Task.Run(() =>
-            {
-                var groups = new List<string>();
-
-                try
-                {
-                    var connResult = TryMultipleConnectionStrategies(
-                        _settings.ServiceAccountUsername,
-                        _settings.ServiceAccountPassword);
-
-                    if (!connResult.Success || connResult.Connection == null)
-                    {
-                        _logger.LogError("Failed to connect for GetUserGroups: {Errors}", connResult.ErrorMessage);
-                        return groups;
-                    }
-
-                    using (connResult.Connection)
-                    {
-                        var filter = BuildUserFilter(username);
-                        var searchRequest = new System.DirectoryServices.Protocols.SearchRequest(
-                            _settings.BaseDN,
-                            filter,
-                            SearchScope.Subtree,
-                            new[] { "memberOf" });
-
-                        var response = (SearchResponse)connResult.Connection.SendRequest(searchRequest);
-
-                        if (response.Entries.Count > 0)
-                        {
-                            var entry = response.Entries[0];
-                            var memberOf = entry.Attributes["memberOf"];
-                            if (memberOf != null)
-                            {
-                                foreach (string groupDn in memberOf.GetValues(typeof(string)))
-                                {
-                                    var groupName = ExtractCnFromDn(groupDn);
-                                    if (!string.IsNullOrEmpty(groupName))
-                                    {
-                                        groups.Add(groupName);
-                                    }
-                                }
-                            }
-                        }
-
-                        if (_settings.EnableCache)
-                        {
-                            _cache.Set(cacheKey, groups, TimeSpan.FromMinutes(_settings.CacheDurationMinutes));
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error getting groups for user: {Username}", username);
-                }
-
-                return groups;
-            });
+            _cache.Set(cacheKey, groups, new MemoryCacheEntryOptions()
+                .SetAbsoluteExpiration(TimeSpan.FromMinutes(_settings.CacheDurationMinutes))
+                .SetSize(1));
         }
-        finally
-        {
-            _connectionLock.Release();
-        }
+
+        return groups;
     }
 
     /// <inheritdoc />
     public async Task<bool> IsUserInGroupAsync(string username, string groupName)
     {
-        if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(groupName))
-            return false;
+        if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(groupName)) return false;
 
         var groups = await GetUserGroupsAsync(username);
         return groups.Any(g => g.Equals(groupName, StringComparison.OrdinalIgnoreCase));
     }
 
-    #region Private Helper Methods
-
-    /// <summary>
-    /// Connection strategy for multi-format LDAP authentication
-    /// </summary>
-    private class ConnectionStrategy
+    /// <inheritdoc />
+    public void ClearCache()
     {
-        public string Name { get; set; } = "";
-        public string Server { get; set; } = "";
-        public int Port { get; set; }
-        public bool UseSSL { get; set; }
-        public AuthType AuthType { get; set; }
-        public Func<string, string, string> UsernameFormatter { get; set; } = (u, d) => u;
-    }
-
-    /// <summary>
-    /// Result of connection attempt with strategy info
-    /// </summary>
-    public class ConnectionResult
-    {
-        public bool Success { get; set; }
-        public string StrategyName { get; set; } = "";
-        public string UsernameFormat { get; set; } = "";
-        public string? ErrorMessage { get; set; }
-        public LdapConnection? Connection { get; set; }
-    }
-
-    /// <summary>
-    /// Try multiple connection strategies and return the first successful one
-    /// </summary>
-    private ConnectionResult TryMultipleConnectionStrategies(string username, string password)
-    {
-        var strategies = BuildConnectionStrategies();
-        var errors = new List<string>();
-
-        foreach (var strategy in strategies)
+        if (_cache is MemoryCache memoryCache)
         {
-            try
-            {
-                var formattedUsername = strategy.UsernameFormatter(username, _settings.Domain);
-
-                _logger.LogDebug("Trying connection strategy: {Strategy} with username format: {Username}",
-                    strategy.Name, formattedUsername);
-
-                var connection = CreateConnectionWithStrategy(formattedUsername, password, strategy);
-
-                _logger.LogInformation(
-                    "✓ CONNECTION SUCCESS - Strategy: {Strategy}, Server: {Server}:{Port}, SSL: {UseSSL}, Username: {Username}",
-                    strategy.Name, strategy.Server, strategy.Port, strategy.UseSSL, formattedUsername);
-
-                return new ConnectionResult
-                {
-                    Success = true,
-                    StrategyName = strategy.Name,
-                    UsernameFormat = formattedUsername,
-                    Connection = connection
-                };
-            }
-            catch (LdapException ex)
-            {
-                var errorMsg = $"Strategy '{strategy.Name}': LDAP Error {ex.ErrorCode} - {ex.Message}";
-                errors.Add(errorMsg);
-                _logger.LogWarning("✗ {Error}", errorMsg);
-            }
-            catch (Exception ex)
-            {
-                var errorMsg = $"Strategy '{strategy.Name}': {ex.GetType().Name} - {ex.Message}";
-                errors.Add(errorMsg);
-                _logger.LogWarning("✗ {Error}", errorMsg);
-            }
+            memoryCache.Compact(1.0);
         }
-
-        // All strategies failed
-        _logger.LogWarning("All connection strategies failed for user: {Username}. Errors:\n{Errors}",
-            username, string.Join("\n", errors));
-
-        return new ConnectionResult
-        {
-            Success = false,
-            ErrorMessage = string.Join("; ", errors)
-        };
     }
 
-    /// <summary>
-    /// Build list of connection strategies to try
-    /// </summary>
-    private List<ConnectionStrategy> BuildConnectionStrategies()
+    #endregion
+
+    #region Authentication core
+
+    private LdapAuthResult AuthenticateCore(string username, string password)
     {
-        var strategies = new List<ConnectionStrategy>();
-        var servers = new[] { _settings.Server };
+        var s = _settings;
+        _logger.LogInformation("=== Starting Authentication for: {Username} ({Format}) ===",
+            username, DetectUsernameFormat(username));
 
-        // Port combinations to try
-        var portConfigs = new[]
-        {
-            (Port: 636, UseSSL: true, Name: "LDAPS-636"),
-            (Port: 636, UseSSL: false, Name: "LDAP-636-NoSSL"),
-            (Port: 389, UseSSL: false, Name: "LDAP-389"),
-            (Port: 3269, UseSSL: true, Name: "GC-SSL-3269"),
-            (Port: 3268, UseSSL: false, Name: "GC-3268")
-        };
+        // Step 1: resolve the user with the service account.
+        UserInfo? directoryUser = null;
+        var lookupCompleted = false;
 
-        // Username format functions
-        var usernameFormats = new (string Name, Func<string, string, string> Formatter)[]
+        var service = ConnectServiceAccount(s, honorBackoff: true, recordStats: true);
+        if (service.Success)
         {
-            ("UPN", (u, d) => u.Contains("@") ? u : $"{u}@{d}"),
-            ("UPN-Email", (u, d) => u.Contains("@") ? u : $"{u}@ipsos.com"),
-            ("NetBIOS", (u, d) => {
-                var domainShort = d.Split('.')[0].ToUpperInvariant();
-                var cleanUser = u.Contains("@") ? u.Split('@')[0] : u;
-                return $"{domainShort}\\{cleanUser}";
-            }),
-            ("SAM-Only", (u, d) => u.Contains("@") ? u.Split('@')[0] : u),
-            ("DN-Format", (u, d) => {
-                var cleanUser = u.Contains("@") ? u.Split('@')[0] : u;
-                var dcParts = d.Split('.').Select(p => $"DC={p}").ToArray();
-                return $"CN={cleanUser},CN=Users,{string.Join(",", dcParts)}";
-            })
-        };
-
-        // Build all combinations - prioritize LDAPS with UPN first
-        foreach (var portConfig in portConfigs)
-        {
-            foreach (var format in usernameFormats)
+            using (service.Connection)
             {
-                foreach (var server in servers)
+                try
                 {
-                    strategies.Add(new ConnectionStrategy
+                    directoryUser = SearchUser(service.Connection!, s, username, out var referralsOnly);
+                    lookupCompleted = !referralsOnly;
+                    if (referralsOnly)
                     {
-                        Name = $"{portConfig.Name}-{format.Name}",
-                        Server = server,
-                        Port = portConfig.Port,
-                        UseSSL = portConfig.UseSSL,
-                        AuthType = AuthType.Basic,
-                        UsernameFormatter = format.Formatter
-                    });
+                        _logger.LogWarning(
+                            "Search for {Username} returned only referrals. Enable ChaseReferrals or use a Global Catalog port.",
+                            username);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("User lookup failed for {Username} ({Error}); falling back to direct bind",
+                        username, ex.Message);
                 }
             }
         }
-
-        // Also try Negotiate auth type for Windows integrated auth
-        strategies.Add(new ConnectionStrategy
+        else
         {
-            Name = "LDAPS-Negotiate",
-            Server = _settings.Server,
-            Port = 636,
-            UseSSL = true,
-            AuthType = AuthType.Negotiate,
-            UsernameFormatter = (u, d) => u.Contains("@") ? u : $"{u}@{d}"
-        });
+            _logger.LogWarning("Service account unavailable ({Error}); falling back to direct bind", service.ErrorMessage);
+        }
 
-        return strategies;
+        if (directoryUser == null && lookupCompleted)
+        {
+            // Nothing to bind to: answering here costs no bad-password count in AD.
+            return LdapAuthResult.Fail(AuthFailureReason.UserNotFound, "User not found in directory");
+        }
+
+        // Step 2: bind once as the user found in the directory.
+        if (directoryUser != null)
+        {
+            if (!directoryUser.IsEnabled)
+            {
+                return WithMethod(LdapAuthResult.Fail(AuthFailureReason.AccountDisabled, "Account is disabled"), "SearchThenBind");
+            }
+
+            var bindNames = new[] { directoryUser.UserPrincipalName, directoryUser.DistinguishedName }
+                .Where(n => !string.IsNullOrWhiteSpace(n))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            var bind = TryBind(s, BuildStrategies(s, includeNegotiate: true), bindNames, password,
+                serviceFingerprint: null, attempts: null, recordStats: true);
+
+            if (!bind.Success)
+            {
+                var message = bind.ErrorMessage;
+                if (directoryUser.IsLocked && bind.FailureReason == AuthFailureReason.InvalidCredentials)
+                {
+                    message += " (the account has lockoutTime set: it may be locked out)";
+                }
+                return WithMethod(LdapAuthResult.Fail(bind.FailureReason, message), "SearchThenBind", bind.Strategy?.Name);
+            }
+
+            bind.Connection?.Dispose();
+            CacheAuthenticatedUser(directoryUser);
+            return new LdapAuthResult
+            {
+                Success = true,
+                User = directoryUser,
+                Method = "SearchThenBind",
+                Strategy = bind.Strategy?.Name
+            };
+        }
+
+        // Step 3: the directory could not be searched; try direct binds (simple binds report AD sub-codes reliably).
+        var formats = GetUsernameFormats(s, username);
+        var direct = TryBind(s, BuildStrategies(s, includeNegotiate: false), formats, password,
+            serviceFingerprint: null, attempts: null, recordStats: true);
+
+        if (direct.Success)
+        {
+            UserInfo? user = null;
+            using (direct.Connection)
+            {
+                try
+                {
+                    // Authenticated users can normally read their own entry.
+                    user = SearchUser(direct.Connection!, s, username, out _);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug("Could not read own entry after direct bind: {Error}", ex.Message);
+                }
+            }
+
+            user ??= BasicUserInfo(username, direct.BoundAs);
+            CacheAuthenticatedUser(user);
+            return new LdapAuthResult { Success = true, User = user, Method = "DirectBind", Strategy = direct.Strategy?.Name };
+        }
+
+        if (direct.ReachedDirectory)
+        {
+            return WithMethod(LdapAuthResult.Fail(direct.FailureReason, direct.ErrorMessage), "DirectBind", direct.Strategy?.Name);
+        }
+
+        // Step 4: no LDAP endpoint answered at all; Windows PrincipalContext is the last resort.
+        return TryPrincipalContext(s, username, password);
     }
 
-    /// <summary>
-    /// Create connection using specific strategy
-    /// </summary>
-    private LdapConnection CreateConnectionWithStrategy(string username, string password, ConnectionStrategy strategy)
+    private LdapAuthResult TryPrincipalContext(LdapSettings s, string username, string password)
     {
-        var identifier = new LdapDirectoryIdentifier(strategy.Server, strategy.Port);
-        var credential = new NetworkCredential(username, password);
-        var connection = new LdapConnection(identifier, credential)
+        if (!OperatingSystem.IsWindows())
         {
-            AuthType = strategy.AuthType,
-            AutoBind = false
-        };
+            return LdapAuthResult.Fail(AuthFailureReason.ServerUnavailable, "No domain controller could be reached");
+        }
 
-        connection.SessionOptions.ProtocolVersion = 3;
-        connection.Timeout = TimeSpan.FromSeconds(_settings.ConnectionTimeout);
-
-        if (strategy.UseSSL)
+        foreach (var server in Servers(s))
         {
-            connection.SessionOptions.SecureSocketLayer = true;
-
-            if (_settings.SkipCertificateValidation)
+            try
             {
-                connection.SessionOptions.VerifyServerCertificate = (conn, cert) => true;
+                using var context = new PrincipalContext(ContextType.Domain, server);
+                // Exactly one attempt: the default overload silently retries with other bind types.
+                var valid = context.ValidateCredentials(username, password,
+                    ContextOptions.Negotiate | ContextOptions.Signing | ContextOptions.Sealing);
+
+                if (!valid)
+                {
+                    return WithMethod(LdapAuthResult.Fail(AuthFailureReason.InvalidCredentials, "Rejected by PrincipalContext"),
+                        "PrincipalContext", server);
+                }
+
+                var user = BasicUserInfo(username, username);
+                CacheAuthenticatedUser(user);
+                return new LdapAuthResult { Success = true, User = user, Method = "PrincipalContext", Strategy = server };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("PrincipalContext fallback failed on {Server}: {Error}", server, ex.Message);
             }
         }
 
-        connection.Bind();
-        return connection;
+        return LdapAuthResult.Fail(AuthFailureReason.ServerUnavailable, "No domain controller could be reached");
     }
 
-    private LdapConnection CreateConnection(string username, string password)
+    private static LdapAuthResult WithMethod(LdapAuthResult result, string method, string? strategy = null)
     {
-        var identifier = new LdapDirectoryIdentifier(_settings.Server, _settings.Port);
-        var credential = new NetworkCredential(username, password);
-        var connection = new LdapConnection(identifier, credential)
+        result.Method = method;
+        result.Strategy = strategy;
+        return result;
+    }
+
+    #endregion
+
+    #region Connections and strategies
+
+    private sealed record Strategy(string Name, string Server, int Port, bool Ssl, AuthType Auth, bool Seal)
+    {
+        public bool Secure => Ssl || Seal;
+        public string EndpointKey => $"{Server.ToLowerInvariant()}:{Port}:{(Ssl ? "ssl" : "plain")}";
+    }
+
+    private sealed class BindOutcome
+    {
+        public bool Success { get; init; }
+        public LdapConnection? Connection { get; init; }
+        public Strategy? Strategy { get; init; }
+        public string? BoundAs { get; init; }
+        public AuthFailureReason FailureReason { get; init; }
+        public string? ErrorMessage { get; init; }
+
+        /// <summary>True when a DC answered (so credentials, not connectivity, decided the result)</summary>
+        public bool ReachedDirectory { get; init; }
+    }
+
+    private static IEnumerable<string> Servers(LdapSettings s) =>
+        new[] { s.Server }.Concat(s.FallbackServers ?? new List<string>())
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Ordered connection strategies: the cached working one first, then the configured
+    /// port, then the most secure transports, then plain-text ones.
+    /// </summary>
+    private List<Strategy> BuildStrategies(LdapSettings s, bool includeNegotiate, bool ignorePreferred = false)
+    {
+        var transports = new List<(int Port, bool Ssl, AuthType Auth, bool Seal)>
         {
-            AuthType = AuthType.Basic,
-            AutoBind = false
+            (s.Port, s.UseSSL, AuthType.Basic, false),
+            (636, true, AuthType.Basic, false),
+            (3269, true, AuthType.Basic, false)
         };
+        if (includeNegotiate) transports.Add((389, false, AuthType.Negotiate, true));
+        transports.Add((636, false, AuthType.Basic, false));
+        transports.Add((389, false, AuthType.Basic, false));
+        transports.Add((3268, false, AuthType.Basic, false));
 
-        connection.SessionOptions.ProtocolVersion = 3;
-        connection.Timeout = TimeSpan.FromSeconds(_settings.ConnectionTimeout);
-
-        if (_settings.UseSSL)
+        var strategies = new List<Strategy>();
+        var primary = true;
+        foreach (var server in Servers(s))
         {
-            connection.SessionOptions.SecureSocketLayer = true;
-
-            if (_settings.SkipCertificateValidation)
+            foreach (var t in transports.Distinct())
             {
-                connection.SessionOptions.VerifyServerCertificate = (conn, cert) => true;
+                var label = TransportLabel(t.Port, t.Ssl, t.Seal);
+                strategies.Add(new Strategy(primary ? label : $"{label}@{server}", server, t.Port, t.Ssl, t.Auth, t.Seal));
             }
+            primary = false;
         }
 
-        connection.Bind();
-        return connection;
+        var preferred = ignorePreferred ? null : _strategyCache.PreferredStrategy;
+
+        // OrderBy is stable, so the declared order is kept within each group.
+        return strategies
+            .OrderBy(st => st.Name == preferred ? 0 : 1)
+            .ThenBy(st => _strategyCache.IsEndpointRecentlyDown(st.Server, st.Port, st.Ssl) ? 1 : 0)
+            .ToList();
     }
 
-    private LdapConnection CreateServiceConnection()
+    private static string TransportLabel(int port, bool ssl, bool seal) => (port, ssl, seal) switch
     {
-        var bindDn = _settings.ServiceAccountUsername;
-        if (!bindDn.Contains("@") && !bindDn.Contains(","))
+        (636, true, _) => "LDAPS-636",
+        (3269, true, _) => "GC-SSL-3269",
+        (389, false, true) => "LDAP-389-Sealed",
+        (636, false, _) => "LDAP-636-NoSSL",
+        (389, false, false) => "LDAP-389",
+        (3268, false, _) => "GC-3268",
+        _ => $"{(ssl ? "LDAPS" : "LDAP")}-{port}{(seal ? "-Sealed" : "")}"
+    };
+
+    private BindOutcome ConnectServiceAccount(LdapSettings s, bool honorBackoff, bool recordStats,
+        bool ignorePreferred = false, List<LdapAttempt>? attempts = null)
+    {
+        if (string.IsNullOrWhiteSpace(s.ServiceAccountUsername) || string.IsNullOrEmpty(s.ServiceAccountPassword))
         {
-            bindDn = $"{bindDn}@{_settings.Domain}";
+            return new BindOutcome
+            {
+                FailureReason = AuthFailureReason.Error,
+                ErrorMessage = "Service account username or password is not configured"
+            };
         }
 
-        return CreateConnection(bindDn, _settings.ServiceAccountPassword);
+        var fingerprint = ServiceFingerprint(s);
+        if (honorBackoff && _strategyCache.IsServiceAccountBlocked(fingerprint, out var until, out var reason))
+        {
+            return new BindOutcome
+            {
+                FailureReason = AuthFailureReason.InvalidCredentials,
+                ReachedDirectory = true,
+                ErrorMessage = $"Service account sign-in paused until {until:HH:mm} UTC because AD rejected its password " +
+                               $"({reason}). Retrying would lock the account. Update the password in Settings > LDAP."
+            };
+        }
+
+        return TryBind(s, BuildStrategies(s, includeNegotiate: true, ignorePreferred), ServiceAccountNames(s),
+            s.ServiceAccountPassword, fingerprint, attempts, recordStats);
     }
 
     /// <summary>
-    /// Create service connection trying multiple strategies
+    /// Try strategies (outer) and bind names (inner) until one binds or AD gives a definitive answer.
     /// </summary>
-    private LdapConnection CreateServiceConnectionMultiStrategy()
+    private BindOutcome TryBind(
+        LdapSettings s,
+        IReadOnlyList<Strategy> strategies,
+        IReadOnlyList<string> names,
+        string password,
+        string? serviceFingerprint,
+        List<LdapAttempt>? attempts,
+        bool recordStats)
     {
-        var result = TryMultipleConnectionStrategies(
-            _settings.ServiceAccountUsername,
-            _settings.ServiceAccountPassword);
+        var downEndpoints = new HashSet<string>();
+        var errors = new List<string>();
+        var reachedDirectory = false;
+        var lastReason = AuthFailureReason.ServerUnavailable;
+        Strategy? lastStrategy = null;
 
-        if (result.Success && result.Connection != null)
+        foreach (var strategy in strategies)
         {
-            return result.Connection;
+            if (downEndpoints.Contains(strategy.EndpointKey)) continue;
+
+            // Negotiate needs a principal name (UPN or DOMAIN\user), not a DN.
+            var candidateNames = strategy.Auth == AuthType.Negotiate
+                ? names.Where(n => !n.Contains('=')).ToList()
+                : names.ToList();
+
+            var allNotFound = candidateNames.Count > 0;
+
+            foreach (var name in candidateNames)
+            {
+                var sw = Stopwatch.StartNew();
+                lastStrategy = strategy;
+                try
+                {
+                    var connection = CreateConnection(s, strategy, name, password);
+                    sw.Stop();
+
+                    if (recordStats)
+                    {
+                        _strategyCache.RecordSuccess(strategy.Name, strategy.Server, strategy.Port, strategy.Ssl,
+                            strategy.Secure, sw.ElapsedMilliseconds, makePreferred: true);
+                    }
+                    attempts?.Add(new LdapAttempt { Strategy = $"{strategy.Name} as {name}", Success = true, LatencyMs = sw.ElapsedMilliseconds });
+                    _logger.LogInformation("✓ LDAP bind OK - {Strategy} ({Server}:{Port}, secure={Secure}) as {Name} in {Ms}ms",
+                        strategy.Name, strategy.Server, strategy.Port, strategy.Secure, name, sw.ElapsedMilliseconds);
+
+                    return new BindOutcome { Success = true, Connection = connection, Strategy = strategy, BoundAs = name, ReachedDirectory = true };
+                }
+                catch (LdapException ex)
+                {
+                    sw.Stop();
+                    var description = DescribeLdapError(ex);
+                    attempts?.Add(new LdapAttempt { Strategy = $"{strategy.Name} as {name}", Success = false, Error = description, LatencyMs = sw.ElapsedMilliseconds });
+
+                    // A sealed (Kerberos/NTLM) bind can fail with 81 for SASL reasons while plain binds on the
+                    // same port still work, so it never marks the endpoint itself as down.
+                    if (IsConnectivityError(ex.ErrorCode) && strategy.Seal)
+                    {
+                        Record(false, strategy, sw.ElapsedMilliseconds, description, endpointDown: false);
+                        errors.Add($"{strategy.Name}: {description}");
+                        _logger.LogWarning("✗ {Strategy}: {Error}", strategy.Name, description);
+                        allNotFound = false;
+                        break;
+                    }
+
+                    if (IsConnectivityError(ex.ErrorCode))
+                    {
+                        downEndpoints.Add(strategy.EndpointKey);
+                        Record(false, strategy, sw.ElapsedMilliseconds, description, endpointDown: true);
+                        errors.Add($"{strategy.Name}: {description}");
+                        _logger.LogWarning("✗ {Strategy}: {Error}", strategy.Name, description);
+                        allNotFound = false;
+                        break; // next strategy: this endpoint is unreachable for every name
+                    }
+
+                    if (ex.ErrorCode == 49)
+                    {
+                        reachedDirectory = true;
+                        var reason = MapAdError(ex.ServerErrorMessage);
+                        Record(false, strategy, sw.ElapsedMilliseconds, description, endpointDown: false);
+
+                        if (reason == AuthFailureReason.UserNotFound)
+                        {
+                            lastReason = reason;
+                            continue; // this name format doesn't exist: try the next one (no lockout cost)
+                        }
+
+                        // Definitive answer about an existing account. Stop now: every further
+                        // attempt would add another bad-password count toward AD lockout.
+                        if (serviceFingerprint != null && reason == AuthFailureReason.InvalidCredentials)
+                        {
+                            _strategyCache.BlockServiceAccount(serviceFingerprint, description);
+                        }
+                        _logger.LogWarning("✗ {Strategy} as {Name}: {Reason} - stopping to avoid account lockout",
+                            strategy.Name, name, reason);
+
+                        return new BindOutcome
+                        {
+                            FailureReason = reason,
+                            ErrorMessage = description,
+                            Strategy = strategy,
+                            ReachedDirectory = true
+                        };
+                    }
+
+                    // Transport/auth level problem (e.g. signing required, auth method not supported).
+                    Record(false, strategy, sw.ElapsedMilliseconds, description, endpointDown: false);
+                    errors.Add($"{strategy.Name}: {description}");
+                    _logger.LogWarning("✗ {Strategy}: {Error}", strategy.Name, description);
+                    allNotFound = false;
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    sw.Stop();
+                    var description = $"{ex.GetType().Name}: {ex.Message}";
+                    attempts?.Add(new LdapAttempt { Strategy = $"{strategy.Name} as {name}", Success = false, Error = description, LatencyMs = sw.ElapsedMilliseconds });
+                    Record(false, strategy, sw.ElapsedMilliseconds, description, endpointDown: false);
+                    errors.Add($"{strategy.Name}: {description}");
+                    _logger.LogWarning("✗ {Strategy}: {Error}", strategy.Name, description);
+                    allNotFound = false;
+                    break;
+                }
+            }
+
+            if (allNotFound && reachedDirectory)
+            {
+                // Every name format was unknown to a DC that answered: other transports reach the same directory.
+                return new BindOutcome
+                {
+                    FailureReason = AuthFailureReason.UserNotFound,
+                    ErrorMessage = "No matching account for any username format",
+                    Strategy = strategy,
+                    ReachedDirectory = true
+                };
+            }
         }
 
-        throw new LdapException($"All connection strategies failed: {result.ErrorMessage}");
+        return new BindOutcome
+        {
+            FailureReason = reachedDirectory ? lastReason : AuthFailureReason.ServerUnavailable,
+            ErrorMessage = errors.Count > 0 ? string.Join("; ", errors) : "No connection strategy succeeded",
+            Strategy = lastStrategy,
+            ReachedDirectory = reachedDirectory
+        };
+
+        void Record(bool ok, Strategy st, long ms, string error, bool endpointDown)
+        {
+            if (!recordStats) return;
+            _strategyCache.RecordFailure(st.Name, st.Server, st.Port, st.Ssl, st.Secure, ms, error, endpointDown);
+        }
     }
 
-    private UserInfo? SearchUser(LdapConnection connection, string username)
+    private static LdapConnection CreateConnection(LdapSettings s, Strategy strategy, string username, string password)
+    {
+        var connection = new LdapConnection(new LdapDirectoryIdentifier(strategy.Server, strategy.Port))
+        {
+            AuthType = strategy.Auth,
+            AutoBind = false,
+            Timeout = TimeSpan.FromSeconds(Math.Max(1, s.ConnectionTimeout)),
+            Credential = MakeCredential(username, password)
+        };
+
+        try
+        {
+            connection.SessionOptions.ProtocolVersion = 3;
+            connection.SessionOptions.ReferralChasing = s.ChaseReferrals ? ReferralChasingOptions.All : ReferralChasingOptions.None;
+
+            if (strategy.Ssl)
+            {
+                connection.SessionOptions.SecureSocketLayer = true;
+                if (s.SkipCertificateValidation)
+                {
+                    connection.SessionOptions.VerifyServerCertificate = (_, _) => true;
+                }
+            }
+
+            if (strategy.Seal)
+            {
+                connection.SessionOptions.Signing = true;
+                connection.SessionOptions.Sealing = true;
+            }
+
+            connection.Bind();
+            return connection;
+        }
+        catch
+        {
+            connection.Dispose();
+            throw;
+        }
+    }
+
+    private static NetworkCredential MakeCredential(string username, string password)
+    {
+        var slash = username.IndexOf('\\');
+        return slash > 0
+            ? new NetworkCredential(username[(slash + 1)..], password, username[..slash])
+            : new NetworkCredential(username, password);
+    }
+
+    private static bool IsConnectivityError(int code) => code is 52 or 81 or 85 or 91;
+
+    private static string DescribeLdapError(LdapException ex)
+    {
+        var detail = string.IsNullOrWhiteSpace(ex.ServerErrorMessage) ? string.Empty : $" [{ex.ServerErrorMessage.Trim().TrimEnd('\0')}]";
+        return $"LDAP {ex.ErrorCode}: {ex.Message}{detail}";
+    }
+
+    [GeneratedRegex(@"data\s+([0-9a-fA-F]{3,4})")]
+    private static partial Regex AdDataCodeRegex();
+
+    /// <summary>
+    /// Translate the AD "data xxx" sub-code of an LDAP 49 error. Unknown → InvalidCredentials (fail safe).
+    /// </summary>
+    internal static AuthFailureReason MapAdError(string? serverMessage)
+    {
+        if (string.IsNullOrEmpty(serverMessage)) return AuthFailureReason.InvalidCredentials;
+
+        var match = AdDataCodeRegex().Match(serverMessage);
+        if (!match.Success) return AuthFailureReason.InvalidCredentials;
+
+        return match.Groups[1].Value.ToLowerInvariant() switch
+        {
+            "525" => AuthFailureReason.UserNotFound,
+            "52e" => AuthFailureReason.InvalidCredentials,
+            "530" or "531" => AuthFailureReason.LogonNotPermitted,
+            "532" => AuthFailureReason.PasswordExpired,
+            "533" => AuthFailureReason.AccountDisabled,
+            "701" => AuthFailureReason.AccountExpired,
+            "773" => AuthFailureReason.PasswordMustChange,
+            "775" => AuthFailureReason.AccountLocked,
+            _ => AuthFailureReason.InvalidCredentials
+        };
+    }
+
+    private static string ServiceFingerprint(LdapSettings s)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes($"{s.Server}|{s.ServiceAccountUsername}|{s.ServiceAccountPassword}"));
+        return Convert.ToHexString(bytes, 0, 8);
+    }
+
+    private static string NetBios(LdapSettings s) =>
+        !string.IsNullOrWhiteSpace(s.NetBiosDomain)
+            ? s.NetBiosDomain.Trim()
+            : (s.Domain.Split('.').FirstOrDefault() ?? string.Empty).ToUpperInvariant();
+
+    private static List<string> ServiceAccountNames(LdapSettings s)
+    {
+        var name = s.ServiceAccountUsername.Trim();
+        var names = new List<string>();
+        if (name.Contains('@') || name.Contains('\\') || name.Contains('=')) names.Add(name);
+
+        var sam = ExtractSamAccountName(name);
+        if (!name.Contains('=') && !string.IsNullOrEmpty(sam))
+        {
+            if (!string.IsNullOrEmpty(s.Domain)) names.Add($"{sam}@{s.Domain}");
+            if (!string.IsNullOrEmpty(NetBios(s))) names.Add($"{NetBios(s)}\\{sam}");
+        }
+
+        return names.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    /// <summary>
+    /// Username formats for direct binds when the directory cannot be searched.
+    /// Supports email/UPN (user@domain), Pre-Windows 2000 (DOMAIN\user) and plain sAMAccountName.
+    /// </summary>
+    private static List<string> GetUsernameFormats(LdapSettings s, string username)
+    {
+        // Canonical forms first. AD answers an unresolvable name (e.g. a bare "user") with the same
+        // "data 52e" as a wrong password, which would stop the attempt before a working form is tried.
+        var sam = ExtractSamAccountName(username);
+        var formats = new List<string>();
+        if (username.Contains('\\')) formats.Add(username);
+        if (!string.IsNullOrEmpty(NetBios(s))) formats.Add($"{NetBios(s)}\\{sam}");
+        if (!string.IsNullOrEmpty(s.Domain)) formats.Add($"{sam}@{s.Domain}");
+        if (username.Contains('@')) formats.Add(username);
+        return formats.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    #endregion
+
+    #region Diagnostics
+
+    private ConnectionTestResult RunDiagnostics()
+    {
+        var s = _settings;
+        var stopwatch = Stopwatch.StartNew();
+        var result = new ConnectionTestResult
+        {
+            Server = s.Server,
+            ConfiguredPort = s.Port,
+            TestStartTime = DateTime.UtcNow
+        };
+
+        _logger.LogInformation("=== Starting LDAP diagnostics for {Server} (service account {Account}) ===",
+            s.Server, s.ServiceAccountUsername);
+
+        if (string.IsNullOrEmpty(s.ServiceAccountPassword))
+        {
+            result.Hints.Add("Service account password is not configured.");
+            result.TotalTestTimeMs = stopwatch.ElapsedMilliseconds;
+            return result;
+        }
+
+        var names = ServiceAccountNames(s);
+        var downEndpoints = new HashSet<string>();
+        var credentialsRejected = false;
+
+        foreach (var strategy in BuildStrategies(s, includeNegotiate: true, ignorePreferred: true))
+        {
+            var attempt = new ConnectionAttemptResult
+            {
+                StrategyName = strategy.Name,
+                Server = strategy.Server,
+                Port = strategy.Port,
+                UseSSL = strategy.Ssl,
+                AuthType = strategy.Seal ? "Negotiate (signed+sealed)" : strategy.Auth.ToString()
+            };
+
+            if (credentialsRejected || downEndpoints.Contains(strategy.EndpointKey))
+            {
+                attempt.ErrorMessage = credentialsRejected
+                    ? "Skipped: AD rejected the service account password (stopped to avoid account lockout)"
+                    : "Skipped: endpoint unreachable";
+                result.FailedStrategies.Add(attempt);
+                continue;
+            }
+
+            var bindNames = strategy.Auth == AuthType.Negotiate ? names.Where(n => !n.Contains('=')).ToList() : names;
+            foreach (var name in bindNames)
+            {
+                attempt.UsernameFormat = name;
+                var sw = Stopwatch.StartNew();
+                try
+                {
+                    using var connection = CreateConnection(s, strategy, name, s.ServiceAccountPassword);
+                    attempt.Success = true;
+                    attempt.ResponseTimeMs = sw.ElapsedMilliseconds;
+                    attempt.ErrorMessage = null;
+                    attempt.ErrorCode = null;
+                    _strategyCache.RecordSuccess(strategy.Name, strategy.Server, strategy.Port, strategy.Ssl, strategy.Secure,
+                        sw.ElapsedMilliseconds, makePreferred: false);
+                    break;
+                }
+                catch (LdapException ex)
+                {
+                    attempt.ErrorCode = ex.ErrorCode;
+                    attempt.ErrorMessage = $"{GetLdapErrorDescription(ex.ErrorCode)} - {DescribeLdapError(ex)}";
+                    attempt.ResponseTimeMs = sw.ElapsedMilliseconds;
+
+                    var endpointDown = IsConnectivityError(ex.ErrorCode) && !strategy.Seal;
+                    _strategyCache.RecordFailure(strategy.Name, strategy.Server, strategy.Port, strategy.Ssl, strategy.Secure,
+                        sw.ElapsedMilliseconds, attempt.ErrorMessage, endpointDown);
+
+                    if (endpointDown)
+                    {
+                        downEndpoints.Add(strategy.EndpointKey);
+                        break;
+                    }
+
+                    if (ex.ErrorCode == 49)
+                    {
+                        var reason = MapAdError(ex.ServerErrorMessage);
+                        if (reason == AuthFailureReason.UserNotFound) continue;
+                        credentialsRejected = true;
+                        if (reason == AuthFailureReason.InvalidCredentials)
+                        {
+                            _strategyCache.BlockServiceAccount(ServiceFingerprint(s), attempt.ErrorMessage);
+                        }
+                        result.Hints.Add($"AD answered '{reason}' for the service account. Fix the service account before anything else.");
+                    }
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    attempt.ErrorMessage = $"{ex.GetType().Name}: {ex.Message}";
+                    attempt.ResponseTimeMs = sw.ElapsedMilliseconds;
+                    break;
+                }
+            }
+
+            if (attempt.Success)
+            {
+                result.SuccessfulStrategies.Add(attempt);
+                result.RecommendedStrategy ??= attempt;
+                result.Success = true;
+                _logger.LogInformation("✓ {Strategy} as {Name} in {Ms}ms", attempt.StrategyName, attempt.UsernameFormat, attempt.ResponseTimeMs);
+            }
+            else
+            {
+                result.FailedStrategies.Add(attempt);
+                _logger.LogInformation("✗ {Strategy}: {Error}", attempt.StrategyName, attempt.ErrorMessage);
+            }
+        }
+
+        AddHints(s, result);
+        result.TotalTestTimeMs = stopwatch.ElapsedMilliseconds;
+        _logger.LogInformation("=== Diagnostics finished: {Summary} ({Ms}ms) ===", result.Summary, result.TotalTestTimeMs);
+        return result;
+    }
+
+    private static void AddHints(LdapSettings s, ConnectionTestResult result)
+    {
+        var ldapsFailed = result.FailedStrategies.FirstOrDefault(f => f.UseSSL && f.Port == 636 && f.ErrorCode == 81);
+        if (ldapsFailed != null && IsTcpPortOpen(ldapsFailed.Server, 636, 2000))
+        {
+            result.Hints.Add(
+                "Port 636 accepts TCP connections (telnet works) but the LDAPS handshake fails. The domain controller's " +
+                "certificate is most likely not trusted by this server, or its name does not match the server address " +
+                "(connecting by IP usually fails certificate name checks). Fix: import the issuing CA into " +
+                "'Trusted Root Certification Authorities' on this server and connect using the DC's FQDN, " +
+                (s.SkipCertificateValidation
+                    ? "or check that the DC has a valid server-authentication certificate."
+                    : "or (less secure) enable SkipCertificateValidation."));
+        }
+
+        if (result.Success && result.SuccessfulStrategies.All(x => !x.UseSSL && !x.AuthType.StartsWith("Negotiate")))
+        {
+            result.Hints.Add("Only unencrypted strategies work: passwords travel in clear text between this server and the DC.");
+        }
+    }
+
+    internal static bool IsTcpPortOpen(string host, int port, int timeoutMs)
+    {
+        try
+        {
+            using var client = new TcpClient();
+            return client.ConnectAsync(host, port).Wait(timeoutMs) && client.Connected;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string GetLdapErrorDescription(int errorCode) => errorCode switch
+    {
+        0 => "Success",
+        1 => "Operations Error",
+        2 => "Protocol Error",
+        3 => "Time Limit Exceeded",
+        7 => "Authentication Method Not Supported",
+        8 => "Strong Auth Required (DC requires signing/SSL)",
+        32 => "No Such Object (Invalid BaseDN or user not found)",
+        34 => "Invalid DN Syntax",
+        48 => "Inappropriate Authentication",
+        49 => "Invalid Credentials",
+        50 => "Insufficient Access Rights",
+        51 => "Server Busy",
+        52 => "Server Unavailable",
+        53 => "Unwilling To Perform",
+        81 => "Server Down / Cannot Connect (for LDAPS often a certificate problem)",
+        82 => "Local Error",
+        85 => "Connection Timeout",
+        91 => "Connect Error (network or SSL handshake)",
+        _ => $"Error {errorCode}"
+    };
+
+    #endregion
+
+    #region Search and mapping
+
+    private UserInfo? SearchUser(LdapConnection connection, LdapSettings s, string username, out bool referralsOnly)
     {
         var filter = BuildUserFilter(username);
-        _logger.LogInformation("SearchUser filter: {Filter}", filter);
-
-        var searchRequest = new System.DirectoryServices.Protocols.SearchRequest(
-            _settings.BaseDN,
-            filter,
-            SearchScope.Subtree,
-            UserAttributes);
-
-        // Set timeout for search request (5 seconds)
-        var searchTimeout = TimeSpan.FromSeconds(5);
-        _logger.LogInformation("Executing LDAP search (timeout: 5s)...");
-        var response = (SearchResponse)connection.SendRequest(searchRequest, searchTimeout);
-
-        _logger.LogInformation("SearchUser found {Count} entries", response.Entries.Count);
-
-        if (response.Entries.Count > 0)
+        var request = new System.DirectoryServices.Protocols.SearchRequest(s.BaseDN, filter, SearchScope.Subtree, UserAttributes)
         {
-            return MapEntryToUserInfo(response.Entries[0]);
-        }
+            TimeLimit = SearchTimeout
+        };
 
-        return null;
+        var sw = Stopwatch.StartNew();
+        var response = (SearchResponse)connection.SendRequest(request, SearchTimeout);
+        _logger.LogInformation("User search for {Username}: {Count} entries, {Refs} referrals in {Ms}ms",
+            username, response.Entries.Count, response.References.Count, sw.ElapsedMilliseconds);
+
+        // AD always returns referrals to the Configuration / DomainDnsZones / ForestDnsZones partitions for a
+        // domain-root subtree search. Those never hold users; only referrals to other domains make an empty
+        // result inconclusive.
+        referralsOnly = response.Entries.Count == 0 &&
+                        response.References.Cast<SearchResultReference>().Any(r => r.Reference.Any(IsUserBearingReferral));
+        if (response.Entries.Count == 0) return null;
+
+        var users = response.Entries.Cast<SearchResultEntry>().Select(MapEntryToUserInfo).ToList();
+        return ChooseBestMatch(users, username);
     }
 
-    private void CacheUserInfo(string username, UserInfo userInfo)
+    private static bool IsUserBearingReferral(Uri uri)
     {
-        var cacheKey = $"{UserCachePrefix}{username.ToLowerInvariant()}";
-        var cacheOptions = new MemoryCacheEntryOptions()
-            .SetAbsoluteExpiration(TimeSpan.FromMinutes(_settings.CacheDurationMinutes))
-            .SetSize(1);
+        var path = Uri.UnescapeDataString(uri.AbsolutePath).TrimStart('/');
+        return !(path.StartsWith("CN=Configuration,", StringComparison.OrdinalIgnoreCase) ||
+                 path.StartsWith("DC=DomainDnsZones,", StringComparison.OrdinalIgnoreCase) ||
+                 path.StartsWith("DC=ForestDnsZones,", StringComparison.OrdinalIgnoreCase));
+    }
 
-        _cache.Set(cacheKey, userInfo, cacheOptions);
+    /// <summary>
+    /// The filter matches sAMAccountName OR userPrincipalName OR mail, so two different accounts can match
+    /// (e.g. one user's mail equals another user's UPN). Prefer the attribute that matches the input style.
+    /// </summary>
+    private static UserInfo ChooseBestMatch(List<UserInfo> users, string input)
+    {
+        if (users.Count == 1) return users[0];
+
+        var sam = ExtractSamAccountName(input);
+        bool Eq(string? a, string b) => string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+
+        if (input.Contains('@'))
+        {
+            return users.FirstOrDefault(u => Eq(u.UserPrincipalName, input))
+                   ?? users.FirstOrDefault(u => Eq(u.Email, input))
+                   ?? users.FirstOrDefault(u => Eq(u.SamAccountName, sam))
+                   ?? users[0];
+        }
+
+        return users.FirstOrDefault(u => Eq(u.SamAccountName, sam)) ?? users[0];
+    }
+
+    private void CacheUserInfo(string key, UserInfo userInfo)
+    {
+        if (!_settings.EnableCache || _settings.CacheDurationMinutes <= 0) return;
+
+        _cache.Set($"{UserCachePrefix}{key.ToLowerInvariant()}", userInfo, new MemoryCacheEntryOptions()
+            .SetAbsoluteExpiration(TimeSpan.FromMinutes(_settings.CacheDurationMinutes))
+            .SetSize(1));
+    }
+
+    private void CacheAuthenticatedUser(UserInfo user)
+    {
+        foreach (var key in new[] { user.SamAccountName, user.UserPrincipalName, user.Email }
+                     .Where(k => !string.IsNullOrWhiteSpace(k))
+                     .Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            CacheUserInfo(key!, user);
+        }
+    }
+
+    private static UserInfo BasicUserInfo(string input, string? boundAs)
+    {
+        var sam = ExtractSamAccountName(input);
+        return new UserInfo
+        {
+            SamAccountName = sam,
+            UserPrincipalName = boundAs != null && boundAs.Contains('@') ? boundAs : string.Empty,
+            DisplayName = sam,
+            Email = input.Contains('@') ? input : string.Empty,
+            IsEnabled = true
+        };
     }
 
     private static string BuildUserFilter(string username)
     {
-        // Parse username to extract clean SAM account name
-        var cleanUsername = ExtractSamAccountName(username);
-        var escaped = EscapeLdapFilter(cleanUsername);
-        var originalEscaped = EscapeLdapFilter(username);
-
-        // Build filter that searches by:
-        // - sAMAccountName (Pre-Windows 2000 logon name)
-        // - userPrincipalName (UPN - user@domain.com)
-        // - mail (email address)
-        return $"(&(objectClass=user)(objectCategory=person)(|(sAMAccountName={escaped})(userPrincipalName={originalEscaped})(mail={originalEscaped})))";
+        var sam = EscapeLdapFilter(ExtractSamAccountName(username));
+        var original = EscapeLdapFilter(username);
+        return $"(&(objectClass=user)(objectCategory=person)(|(sAMAccountName={sam})(userPrincipalName={original})(mail={original})))";
     }
 
     /// <summary>
-    /// Extract SAM account name from various input formats
-    /// Supports: email@domain.com, DOMAIN\username, username
+    /// Extract the sAMAccountName from DOMAIN\user, user@domain or user
     /// </summary>
-    private static string ExtractSamAccountName(string input)
+    internal static string ExtractSamAccountName(string input)
     {
         if (string.IsNullOrEmpty(input)) return input;
-
-        // Pre-Windows 2000 format: DOMAIN\username
-        if (input.Contains("\\"))
-        {
-            return input.Split('\\').Last();
-        }
-
-        // Email/UPN format: user@domain.com
-        if (input.Contains("@"))
-        {
-            return input.Split('@').First();
-        }
-
-        // Already SAM format
+        if (input.Contains('\\')) return input.Split('\\').Last();
+        if (input.Contains('@')) return input.Split('@').First();
         return input;
     }
 
-    /// <summary>
-    /// Detect the format of the username input
-    /// </summary>
-    private static string DetectUsernameFormat(string input)
+    internal static string DetectUsernameFormat(string input)
     {
         if (string.IsNullOrEmpty(input)) return "Empty";
-
-        // Pre-Windows 2000 format: DOMAIN\username
-        if (input.Contains("\\"))
-        {
-            var parts = input.Split('\\');
-            return $"Pre-Windows 2000 (NetBIOS): Domain={parts[0]}, User={parts[1]}";
-        }
-
-        // Email/UPN format
-        if (input.Contains("@"))
-        {
-            var parts = input.Split('@');
-            var domain = parts[1].ToLowerInvariant();
-
-            if (domain.Contains("."))
-            {
-                // Full domain like user@domain.company.com
-                return $"UPN/Email: User={parts[0]}, Domain={domain}";
-            }
-            else
-            {
-                // Short domain like user@DOMAIN
-                return $"UPN (Short): User={parts[0]}, Domain={domain}";
-            }
-        }
-
-        // Plain SAM account name
-        return $"SAM Account Name: {input}";
+        if (input.Contains('\\')) return "Pre-Windows 2000 (DOMAIN\\user)";
+        if (input.Contains('@')) return "UPN/Email (user@domain)";
+        return "sAMAccountName";
     }
 
     private static UserInfo MapEntryToUserInfo(SearchResultEntry entry)
@@ -944,8 +1228,7 @@ public class LdapService : ILdapService
             Company = GetAttr(entry, "company")
         };
 
-        var uacValue = GetAttr(entry, "userAccountControl");
-        if (int.TryParse(uacValue, out var uac))
+        if (int.TryParse(GetAttr(entry, "userAccountControl"), out var uac))
         {
             const int accountDisabled = 0x0002;
             userInfo.IsEnabled = (uac & accountDisabled) == 0;
@@ -960,17 +1243,13 @@ public class LdapService : ILdapService
             foreach (string groupDn in memberOf.GetValues(typeof(string)))
             {
                 var groupName = ExtractCnFromDn(groupDn);
-                if (!string.IsNullOrEmpty(groupName))
-                {
-                    userInfo.Groups.Add(groupName);
-                }
+                if (!string.IsNullOrEmpty(groupName)) userInfo.Groups.Add(groupName);
             }
         }
 
         userInfo.WhenCreated = ParseLdapTimestamp(GetAttr(entry, "whenCreated"));
         userInfo.WhenChanged = ParseLdapTimestamp(GetAttr(entry, "whenChanged"));
         userInfo.LastLogon = ParseFileTime(GetAttr(entry, "lastLogonTimestamp"));
-
         return userInfo;
     }
 
@@ -979,32 +1258,29 @@ public class LdapService : ILdapService
         try
         {
             var attr = entry.Attributes[name];
-            if (attr != null && attr.Count > 0)
-            {
-                return attr[0]?.ToString() ?? string.Empty;
-            }
+            if (attr != null && attr.Count > 0) return attr[0]?.ToString() ?? string.Empty;
         }
-        catch { }
+        catch
+        {
+            // attribute not present or not a string
+        }
         return string.Empty;
     }
 
     private static string ExtractCnFromDn(string dn)
     {
         if (string.IsNullOrEmpty(dn)) return string.Empty;
-
         if (dn.StartsWith("CN=", StringComparison.OrdinalIgnoreCase))
         {
             var commaIndex = dn.IndexOf(',');
             if (commaIndex > 3) return dn.Substring(3, commaIndex - 3);
         }
-
         return dn;
     }
 
     private static string EscapeLdapFilter(string input)
     {
         if (string.IsNullOrEmpty(input)) return string.Empty;
-
         return input
             .Replace("\\", "\\5c")
             .Replace("*", "\\2a")
@@ -1016,193 +1292,28 @@ public class LdapService : ILdapService
     private static DateTime? ParseLdapTimestamp(string timestamp)
     {
         if (string.IsNullOrEmpty(timestamp) || timestamp.Length < 14) return null;
-
         try
         {
             return new DateTime(
-                int.Parse(timestamp.Substring(0, 4)),
-                int.Parse(timestamp.Substring(4, 2)),
-                int.Parse(timestamp.Substring(6, 2)),
-                int.Parse(timestamp.Substring(8, 2)),
-                int.Parse(timestamp.Substring(10, 2)),
-                int.Parse(timestamp.Substring(12, 2)),
+                int.Parse(timestamp[..4]), int.Parse(timestamp.Substring(4, 2)), int.Parse(timestamp.Substring(6, 2)),
+                int.Parse(timestamp.Substring(8, 2)), int.Parse(timestamp.Substring(10, 2)), int.Parse(timestamp.Substring(12, 2)),
                 DateTimeKind.Utc);
         }
-        catch { return null; }
+        catch
+        {
+            return null;
+        }
     }
 
     private static DateTime? ParseFileTime(string fileTimeString)
     {
-        if (string.IsNullOrEmpty(fileTimeString)) return null;
-
         if (long.TryParse(fileTimeString, out var fileTime) && fileTime > 0)
         {
             try { return DateTime.FromFileTimeUtc(fileTime); }
             catch { return null; }
         }
-
         return null;
     }
-
-    #region Fallback Authentication Methods
-
-    /// <summary>
-    /// Fallback authentication using PrincipalContext (System.DirectoryServices.AccountManagement)
-    /// This is simpler and may work when LDAP protocol methods fail
-    /// </summary>
-    private bool ValidateCredentialsFallback(string username, string password)
-    {
-        var servers = new[] { _settings.Server, _settings.Domain };
-        var userFormats = GetUsernameFormats(username);
-
-        foreach (var server in servers.Where(s => !string.IsNullOrEmpty(s)))
-        {
-            foreach (var userFormat in userFormats)
-            {
-                try
-                {
-                    _logger.LogDebug("Fallback auth attempt - Server: {Server}, User: {User}", server, userFormat);
-
-                    using var pc = new PrincipalContext(ContextType.Domain, server);
-                    var isValid = pc.ValidateCredentials(userFormat, password);
-
-                    if (isValid)
-                    {
-                        _logger.LogInformation("✓ FALLBACK AUTH SUCCESS - Server: {Server}, User: {User}",
-                            server, userFormat);
-                        return true;
-                    }
-
-                    _logger.LogDebug("✗ Fallback auth failed - Server: {Server}, User: {User}", server, userFormat);
-                }
-                catch (PrincipalServerDownException ex)
-                {
-                    _logger.LogDebug("✗ Fallback server down - Server: {Server}, Error: {Error}", server, ex.Message);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogDebug("✗ Fallback auth error - Server: {Server}, Error: {Error}", server, ex.Message);
-                }
-            }
-        }
-
-        return false;
-    }
-
-    /// <summary>
-    /// Get multiple username formats to try for authentication
-    /// Supports: email@domain.com, DOMAIN\username, username (Pre-Windows 2000)
-    /// </summary>
-    private string[] GetUsernameFormats(string username)
-    {
-        var formats = new List<string>();
-        var domainShort = _settings.Domain.Split('.').FirstOrDefault()?.ToUpperInvariant() ?? "IPSOSGROUP";
-
-        // Original format
-        formats.Add(username);
-
-        // Parse to get clean SAM account name
-        string sam;
-        string? emailDomain = null;
-
-        if (username.Contains("\\"))
-        {
-            // Pre-Windows 2000 format: DOMAIN\username
-            var parts = username.Split('\\');
-            sam = parts.Last();
-            _logger.LogDebug("Detected Pre-2000 format. Extracted SAM: {SAM}", sam);
-        }
-        else if (username.Contains("@"))
-        {
-            // Email/UPN format: user@domain.com
-            var parts = username.Split('@');
-            sam = parts.First();
-            emailDomain = parts.Last();
-            _logger.LogDebug("Detected email/UPN format. Extracted SAM: {SAM}, Domain: {Domain}", sam, emailDomain);
-        }
-        else
-        {
-            // Already SAM format
-            sam = username;
-            _logger.LogDebug("Detected SAM format: {SAM}", sam);
-        }
-
-        // Add all possible formats
-        formats.Add(sam);  // Just SAM
-
-        // UPN formats
-        formats.Add($"{sam}@{_settings.Domain}");  // SAM@full.domain.com
-        formats.Add($"{sam}@ipsos.com");           // SAM@ipsos.com
-
-        // Pre-Windows 2000 (NetBIOS) formats
-        formats.Add($"{domainShort}\\{sam}");      // DOMAIN\SAM
-        formats.Add($"IPSOSGROUP\\{sam}");         // IPSOSGROUP\SAM (hardcoded)
-
-        // If original was email, also try with original domain
-        if (!string.IsNullOrEmpty(emailDomain) && !emailDomain.Equals("ipsos.com", StringComparison.OrdinalIgnoreCase))
-        {
-            formats.Add($"{sam}@{emailDomain}");
-        }
-
-        var result = formats.Distinct().ToArray();
-        _logger.LogDebug("Username formats to try: {Formats}", string.Join(", ", result));
-
-        return result;
-    }
-
-    /// <summary>
-    /// Combined authentication: Try LDAP first, then fallback to PrincipalContext
-    /// </summary>
-    private (bool Success, string Method, string? UsernameUsed) AuthenticateWithFallback(string username, string password)
-    {
-        // Method 1: Try multi-strategy LDAP connection
-        _logger.LogDebug("Trying Method 1: Multi-strategy LDAP authentication");
-        var ldapResult = TryMultipleConnectionStrategies(username, password);
-
-        if (ldapResult.Success)
-        {
-            ldapResult.Connection?.Dispose();
-            return (true, $"LDAP-{ldapResult.StrategyName}", ldapResult.UsernameFormat);
-        }
-
-        // Method 2: Try PrincipalContext fallback
-        _logger.LogDebug("Method 1 failed. Trying Method 2: PrincipalContext fallback");
-        var userFormats = GetUsernameFormats(username);
-
-        foreach (var userFormat in userFormats)
-        {
-            if (ValidateCredentialsFallback(userFormat, password))
-            {
-                return (true, "PrincipalContext-Fallback", userFormat);
-            }
-        }
-
-        // Method 3: Try direct LDAP bind with different options
-        _logger.LogDebug("Method 2 failed. Trying Method 3: Direct LDAP simple bind");
-        foreach (var userFormat in userFormats)
-        {
-            try
-            {
-                using var conn = new LdapConnection(
-                    new LdapDirectoryIdentifier(_settings.Server, 389));
-                conn.AuthType = AuthType.Basic;
-                conn.SessionOptions.ProtocolVersion = 3;
-                conn.Credential = new NetworkCredential(userFormat, password);
-                conn.Bind();
-
-                _logger.LogInformation("✓ DIRECT BIND SUCCESS - User: {User}", userFormat);
-                return (true, "DirectBind-389", userFormat);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug("✗ Direct bind failed for {User}: {Error}", userFormat, ex.Message);
-            }
-        }
-
-        return (false, "AllMethodsFailed", null);
-    }
-
-    #endregion
 
     #endregion
 }

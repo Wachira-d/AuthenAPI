@@ -121,6 +121,16 @@ https://your-authen-api.com/api
 }
 ```
 
+| HTTP | ความหมาย | ระบบ client ควรทำ |
+|------|---------|------------------|
+| 200 | Login สำเร็จ | สร้าง session |
+| 401 | Username/password ผิด, ไม่มี user, ถูกล็อก หรือถูก disable (ไม่บอกแยกเพื่อความปลอดภัย) | แสดง "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง" |
+| 403 | API key ไม่มี scope นี้ หรือเรียกจาก IP ที่ key ไม่อนุญาต | แจ้งผู้ดูแลระบบ |
+| 429 | เกิน rate limit (ดู header `Retry-After`) | รอแล้วลองใหม่ |
+| 503 | ติดต่อ Active Directory ไม่ได้ | แสดง "ระบบยืนยันตัวตนขัดข้องชั่วคราว" **อย่า** บอกว่ารหัสผ่านผิด |
+
+Login รองรับ username ทุกรูปแบบ: `user`, `DOMAIN\user`, `user@domain` (UPN) และ email
+
 ### Get User Info (Optional)
 
 **GET** `/ldap/users/{username}`

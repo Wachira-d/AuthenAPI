@@ -117,7 +117,72 @@ AuthenAPI/
 2. **Properties** → **Security** → **Edit** → **Add**
 3. เพิ่ม: `IIS AppPool\AuthenAPIPool`
 4. ให้สิทธิ์: **Read & Execute**, **List folder contents**, **Read**
-5. สำหรับ logs folder: ให้สิทธิ์ **Write** เพิ่มด้วย
+5. สำหรับ `logs` และ `App_Data`: ให้สิทธิ์ **Modify** เพิ่มด้วย (ดูหัวข้อ Admin Portal)
+
+---
+
+## Admin Portal
+
+เปิดที่ `https://<server>/admin/` (รายละเอียดฟีเจอร์และ API ดู `docs/ADMIN_PORTAL.md`)
+
+### 1. สิทธิ์ folder `App_Data` และ `logs`
+
+ระบบเก็บ API keys (แบบ hash), การตั้งค่าที่แก้จากหน้าเว็บ, backup และ Data Protection keys ไว้ใน `App_Data`
+(เปลี่ยนที่อยู่ได้ด้วย `"DataDirectory"` ใน appsettings.json)
+
+```cmd
+mkdir "D:\Web Sites\wwwroot\AuthenAPI\App_Data"
+icacls "D:\Web Sites\wwwroot\AuthenAPI\App_Data" /grant "IIS AppPool\AuthenAPIPool:(OI)(CI)M"
+icacls "D:\Web Sites\wwwroot\AuthenAPI\logs" /grant "IIS AppPool\AuthenAPIPool:(OI)(CI)M"
+```
+
+> **Backup `App_Data` ทุกครั้งก่อน deploy** และ **อย่าลบ** `App_Data\keys` — ถ้าหาย session ของ admin จะหลุด และรหัสผ่าน service account ที่บันทึกผ่านหน้าเว็บจะถอดรหัสไม่ได้ (ต้องกรอกใหม่)
+> เวลา copy ไฟล์ publish ใหม่ ให้ copy ทับเฉพาะไฟล์โปรแกรม อย่า copy ทับ `App_Data` และ `appsettings.json` บน server
+
+### 2. กำหนดผู้ดูแลระบบ
+
+แก้ `appsettings.json` บน server อย่างน้อยหนึ่งวิธี:
+
+```json
+"AdminSettings": {
+  "Enabled": true,
+  "AdminUsers": ["ad-wachira.diloksumpan"],
+  "ViewerUsers": [],
+  "AdminGroups": ["AuthenAPI-Admins"],
+  "ViewerGroups": [],
+  "AllowedIpAddresses": [],
+  "SessionTimeoutMinutes": 60,
+  "LocalAdmins": []
+}
+```
+
+- `AdminUsers` / `ViewerUsers` ใส่ได้ทั้ง sAMAccountName, UPN หรือ email
+- `AdminGroups` / `ViewerGroups` คือชื่อ group ใน AD (นับเฉพาะ direct member ไม่รวม nested group)
+- `AllowedIpAddresses` จำกัด IP ที่เปิดหน้า admin ได้ (ว่าง = ใช้ whitelist หลัก) — จาก server เอง (127.0.0.1) เข้าได้เสมอ
+
+### 3. บัญชีฉุกเฉิน (break-glass) สำหรับตอน AD ล่ม — แนะนำให้มี 1 บัญชี
+
+ถ้า AD ติดต่อไม่ได้ จะ login หน้า admin ด้วยบัญชี AD ไม่ได้ (ซึ่งเป็นตอนที่ต้องเข้าไปแก้ค่า LDAP พอดี) ให้สร้างบัญชี local:
+
+```cmd
+cd "D:\Web Sites\wwwroot\AuthenAPI"
+AuthenAPI.exe hash-password
+```
+
+พิมพ์รหัสผ่าน (อย่างน้อย 12 ตัว) แล้วนำค่าที่ได้ (`pbkdf2-sha256$...`) ใส่:
+
+```json
+"LocalAdmins": [
+  { "Username": "breakglass", "PasswordHash": "pbkdf2-sha256$210000$...", "Role": "Admin" }
+]
+```
+
+เก็บรหัสผ่านนี้ไว้ในที่ปลอดภัย (password vault) ใช้เฉพาะตอนฉุกเฉิน การ login ทุกครั้งถูกบันทึกใน Audit Log
+
+### 4. Health check สำหรับระบบ monitoring
+
+- `GET /health` — process ยังทำงานอยู่ (200 เสมอ)
+- `GET /health/ready` — 200 เมื่อเชื่อม AD ได้, 503 เมื่อเชื่อมไม่ได้ (ไม่เปิดเผยรายละเอียดภายใน)
 
 ---
 

@@ -21,6 +21,23 @@ public class LdapSettings
     public bool UseSSL { get; set; } = true;
 
     /// <summary>
+    /// Additional domain controllers tried when the primary server is unreachable
+    /// </summary>
+    public List<string> FallbackServers { get; set; } = new();
+
+    /// <summary>
+    /// Pre-Windows 2000 (NetBIOS) domain name, e.g. "IPSOSGROUP".
+    /// Defaults to the first label of <see cref="Domain"/> in upper case.
+    /// </summary>
+    public string? NetBiosDomain { get; set; }
+
+    /// <summary>
+    /// Follow LDAP referrals to other domains during searches. Off by default because
+    /// unreachable referral targets make searches hang until the timeout.
+    /// </summary>
+    public bool ChaseReferrals { get; set; } = false;
+
+    /// <summary>
     /// Base DN for user search (e.g., "DC=company,DC=com")
     /// </summary>
     public string BaseDN { get; set; } = string.Empty;

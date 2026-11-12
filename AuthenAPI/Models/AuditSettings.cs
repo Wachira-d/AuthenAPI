@@ -50,4 +50,9 @@ public class AuditSettings
     /// If not set, purge runs at the interval from service start
     /// </summary>
     public string? AutoPurgeTime { get; set; }
+
+    /// <summary>
+    /// Days to keep request log files (logs/requests_yyyyMMdd.jsonl)
+    /// </summary>
+    public int RequestLogRetentionDays { get; set; } = 30;
 }

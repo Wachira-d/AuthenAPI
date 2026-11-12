@@ -1,5 +1,6 @@
 using AuthenAPI.Models;
 using AuthenAPI.Services;
+using AuthenAPI.Utilities;
 using Microsoft.AspNetCore.Mvc;
 
 namespace AuthenAPI.Controllers;
@@ -191,13 +192,8 @@ public class AuditController : ControllerBase
 
     private string? GetClientIpAddress()
     {
-        var forwardedFor = Request.Headers["X-Forwarded-For"].FirstOrDefault();
-        if (!string.IsNullOrEmpty(forwardedFor))
-        {
-            return forwardedFor.Split(',').FirstOrDefault()?.Trim();
-        }
-
-        return HttpContext.Connection.RemoteIpAddress?.ToString();
+        // RemoteIpAddress is already the real client behind IIS; a raw X-Forwarded-For header can be forged.
+        return HttpContext.GetClientIpString();
     }
 
     private string? GetUserAgent()

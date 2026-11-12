@@ -102,6 +102,11 @@ public class ConnectionTestResult
     public List<ConnectionAttemptResult> FailedStrategies { get; set; } = new();
 
     /// <summary>
+    /// Plain-language hints derived from the failures (e.g. certificate trust problems)
+    /// </summary>
+    public List<string> Hints { get; set; } = new();
+
+    /// <summary>
     /// Summary message for display
     /// </summary>
     public string Summary => Success

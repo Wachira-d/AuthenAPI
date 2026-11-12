@@ -11,37 +11,88 @@ namespace AuthenAPI.Services;
 public class AuditService : IAuditService, IDisposable
 {
     private readonly ILogger<AuditService> _logger;
-    private readonly AuditSettings _settings;
+    private readonly IOptionsMonitor<AuditSettings> _settingsMonitor;
     private readonly ConcurrentQueue<AuditLog> _auditLogs;
     private readonly SemaphoreSlim _fileLock;
-    private readonly string _logFilePath;
+    private readonly string _logDirectory;
     private bool _disposed;
+
+    private AuditSettings _settings => _settingsMonitor.CurrentValue;
 
     // Maximum logs to keep in memory
     private const int MaxInMemoryLogs = 10000;
 
-    public AuditService(ILogger<AuditService> logger, IOptions<AuditSettings> settings)
+    public AuditService(ILogger<AuditService> logger, IOptionsMonitor<AuditSettings> settings, IWebHostEnvironment environment)
     {
         _logger = logger;
-        _settings = settings.Value;
+        _settingsMonitor = settings;
         _auditLogs = new ConcurrentQueue<AuditLog>();
         _fileLock = new SemaphoreSlim(1, 1);
 
-        // Set up log file path
-        var logDirectory = _settings.LogDirectory ?? Path.Combine(AppContext.BaseDirectory, "logs");
-        if (!Directory.Exists(logDirectory))
-        {
-            Directory.CreateDirectory(logDirectory);
-        }
-        _logFilePath = Path.Combine(logDirectory, $"audit_{DateTime.UtcNow:yyyyMMdd}.json");
+        var configured = _settings.LogDirectory;
+        if (string.IsNullOrWhiteSpace(configured)) configured = "logs";
+        _logDirectory = Path.IsPathRooted(configured) ? configured : Path.Combine(environment.ContentRootPath, configured);
 
-        _logger.LogInformation("AuditService initialized. File logging: {Enabled}, Path: {Path}",
-            _settings.EnableFileLogging, _logFilePath);
+        try
+        {
+            Directory.CreateDirectory(_logDirectory);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Cannot create audit log directory {Path}", _logDirectory);
+        }
+
+        LoadRecentFiles();
+
+        _logger.LogInformation("AuditService initialized. File logging: {Enabled}, Directory: {Path}, reloaded {Count} entries",
+            _settings.EnableFileLogging, _logDirectory, _auditLogs.Count);
+    }
+
+    /// <summary>
+    /// Reload today's and yesterday's audit files so the trail survives app-pool recycles
+    /// </summary>
+    private void LoadRecentFiles()
+    {
+        try
+        {
+            var today = DateTime.UtcNow.Date;
+            var loaded = new List<AuditLog>();
+            foreach (var day in new[] { today.AddDays(-1), today })
+            {
+                var file = Path.Combine(_logDirectory, $"audit_{day:yyyyMMdd}.json");
+                if (!File.Exists(file)) continue;
+
+                foreach (var line in File.ReadLines(file))
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    try
+                    {
+                        var entry = JsonSerializer.Deserialize<AuditLog>(line);
+                        if (entry != null) loaded.Add(entry);
+                    }
+                    catch (JsonException)
+                    {
+                        // skip partially written line
+                    }
+                }
+            }
+
+            foreach (var entry in loaded.OrderBy(l => l.Timestamp).TakeLast(MaxInMemoryLogs))
+            {
+                _auditLogs.Enqueue(entry);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not reload audit files from {Path}", _logDirectory);
+        }
     }
 
     /// <inheritdoc />
     public async Task LogAsync(AuditLog log)
     {
+        if (!_settings.Enabled) return;
+
         // Add to in-memory queue
         _auditLogs.Enqueue(log);
 
@@ -123,6 +174,33 @@ public class AuditService : IAuditService, IDisposable
             .ToList();
 
         return Task.FromResult(result);
+    }
+
+    /// <inheritdoc />
+    public Task<PagedResult<AuditLog>> QueryPagedAsync(AuditLogQuery query)
+    {
+        IEnumerable<AuditLog> logs = _auditLogs.ToList();
+
+        if (!string.IsNullOrEmpty(query.Username))
+        {
+            logs = logs.Where(l => l.Username != null &&
+                l.Username.Contains(query.Username, StringComparison.OrdinalIgnoreCase));
+        }
+        if (query.Action.HasValue) logs = logs.Where(l => l.Action == query.Action.Value);
+        if (query.Success.HasValue) logs = logs.Where(l => l.Success == query.Success.Value);
+        if (query.FromDate.HasValue) logs = logs.Where(l => l.Timestamp >= query.FromDate.Value.ToUniversalTime());
+        if (query.ToDate.HasValue) logs = logs.Where(l => l.Timestamp <= query.ToDate.Value.ToUniversalTime());
+        if (!string.IsNullOrEmpty(query.IpAddress))
+        {
+            logs = logs.Where(l => l.IpAddress != null && l.IpAddress.Contains(query.IpAddress, StringComparison.OrdinalIgnoreCase));
+        }
+
+        var matches = logs.OrderByDescending(l => l.Timestamp).ToList();
+        return Task.FromResult(new PagedResult<AuditLog>
+        {
+            Total = matches.Count,
+            Items = matches.Skip(Math.Max(0, query.Skip)).Take(Math.Clamp(query.MaxResults, 1, 500)).ToList()
+        });
     }
 
     /// <inheritdoc />
@@ -211,10 +289,7 @@ public class AuditService : IAuditService, IDisposable
         {
             await _fileLock.WaitAsync();
 
-            // Update file path if date changed
-            var currentLogFile = Path.Combine(
-                Path.GetDirectoryName(_logFilePath) ?? "logs",
-                $"audit_{DateTime.UtcNow:yyyyMMdd}.json");
+            var currentLogFile = Path.Combine(_logDirectory, $"audit_{DateTime.UtcNow:yyyyMMdd}.json");
 
             var json = JsonSerializer.Serialize(log, new JsonSerializerOptions
             {

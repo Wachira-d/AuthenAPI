@@ -26,6 +26,11 @@ public interface IAuditService
     Task<List<AuditLog>> QueryAsync(AuditLogQuery query);
 
     /// <summary>
+    /// Query audit logs and return the total number of matches together with one page
+    /// </summary>
+    Task<PagedResult<AuditLog>> QueryPagedAsync(AuditLogQuery query);
+
+    /// <summary>
     /// Get audit log summary/statistics
     /// </summary>
     /// <param name="fromDate">Optional start date</param>

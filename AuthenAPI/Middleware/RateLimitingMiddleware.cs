@@ -1,134 +1,102 @@
 using AuthenAPI.Models;
-using Microsoft.Extensions.Caching.Memory;
+using AuthenAPI.Utilities;
 using Microsoft.Extensions.Options;
 using System.Collections.Concurrent;
 
 namespace AuthenAPI.Middleware;
 
 /// <summary>
-/// Middleware to limit request rates per client
+/// Sliding-window rate limit per client IP for the public API.
+/// The admin portal is excluded (admin logins have their own lockout); per-API-key limits are
+/// enforced by the API key middleware.
 /// </summary>
 public class RateLimitingMiddleware
 {
     private readonly RequestDelegate _next;
     private readonly ILogger<RateLimitingMiddleware> _logger;
-    private readonly SecuritySettings _settings;
+    private readonly IOptionsMonitor<SecuritySettings> _settings;
     private readonly ConcurrentDictionary<string, RateLimitEntry> _clients = new();
+    private long _lastCleanupTicks = DateTime.UtcNow.Ticks;
 
     public RateLimitingMiddleware(
         RequestDelegate next,
         ILogger<RateLimitingMiddleware> logger,
-        IOptions<SecuritySettings> settings)
+        IOptionsMonitor<SecuritySettings> settings)
     {
         _next = next;
         _logger = logger;
-        _settings = settings.Value;
-
-        // Start cleanup task
-        _ = CleanupExpiredEntriesAsync();
+        _settings = settings;
     }
 
     public async Task InvokeAsync(HttpContext context)
     {
-        if (!_settings.EnableRateLimiting)
+        var settings = _settings.CurrentValue;
+        var path = context.Request.Path.Value ?? string.Empty;
+
+        if (!settings.EnableRateLimiting ||
+            context.IsAdminPath() ||
+            settings.ExcludedPaths.Any(p => path.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
         {
             await _next(context);
             return;
         }
 
-        // Check if path is excluded
-        var path = context.Request.Path.Value?.ToLowerInvariant() ?? "";
-        if (_settings.ExcludedPaths.Any(p => path.StartsWith(p.ToLowerInvariant())))
-        {
-            await _next(context);
-            return;
-        }
-
-        var clientId = GetClientIdentifier(context);
+        var clientId = context.GetClientIpString();
+        var window = TimeSpan.FromSeconds(Math.Max(1, settings.RateLimitWindowSeconds));
+        var limit = Math.Max(1, settings.RateLimitMaxRequests);
         var now = DateTime.UtcNow;
-        var windowStart = now.AddSeconds(-_settings.RateLimitWindowSeconds);
 
         var entry = _clients.GetOrAdd(clientId, _ => new RateLimitEntry());
-
+        bool allowed;
+        int remaining;
         lock (entry)
         {
-            // Remove old requests outside the window
-            entry.Requests.RemoveAll(r => r < windowStart);
-
-            if (entry.Requests.Count >= _settings.RateLimitMaxRequests)
-            {
-                _logger.LogWarning("Rate limit exceeded for client: {ClientId}", clientId);
-
-                context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
-                context.Response.Headers.Append("Retry-After", _settings.RateLimitWindowSeconds.ToString());
-                context.Response.Headers.Append("X-RateLimit-Limit", _settings.RateLimitMaxRequests.ToString());
-                context.Response.Headers.Append("X-RateLimit-Remaining", "0");
-                context.Response.Headers.Append("X-RateLimit-Reset", ((DateTimeOffset)windowStart.AddSeconds(_settings.RateLimitWindowSeconds)).ToUnixTimeSeconds().ToString());
-
-                context.Response.WriteAsJsonAsync(new
-                {
-                    error = "Too many requests",
-                    message = $"Rate limit of {_settings.RateLimitMaxRequests} requests per {_settings.RateLimitWindowSeconds} seconds exceeded",
-                    retryAfter = _settings.RateLimitWindowSeconds
-                }).Wait();
-
-                return;
-            }
-
-            entry.Requests.Add(now);
-
-            // Add rate limit headers
-            context.Response.OnStarting(() =>
-            {
-                context.Response.Headers.Append("X-RateLimit-Limit", _settings.RateLimitMaxRequests.ToString());
-                context.Response.Headers.Append("X-RateLimit-Remaining", (_settings.RateLimitMaxRequests - entry.Requests.Count).ToString());
-                return Task.CompletedTask;
-            });
+            entry.Requests.RemoveAll(r => r < now - window);
+            allowed = entry.Requests.Count < limit;
+            if (allowed) entry.Requests.Add(now);
+            remaining = Math.Max(0, limit - entry.Requests.Count);
         }
+
+        CleanupIfDue(now, window);
+
+        if (!allowed)
+        {
+            _logger.LogWarning("Rate limit exceeded for client: {ClientId}", clientId);
+            context.SetRequestOutcome("RateLimited", $"More than {limit} requests in {window.TotalSeconds:0}s");
+            context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+            context.Response.Headers["Retry-After"] = ((int)window.TotalSeconds).ToString();
+            context.Response.Headers["X-RateLimit-Limit"] = limit.ToString();
+            context.Response.Headers["X-RateLimit-Remaining"] = "0";
+            await context.Response.WriteAsJsonAsync(new
+            {
+                error = "Too many requests",
+                message = $"Rate limit of {limit} requests per {window.TotalSeconds:0} seconds exceeded",
+                retryAfter = (int)window.TotalSeconds
+            });
+            return;
+        }
+
+        context.Response.OnStarting(() =>
+        {
+            context.Response.Headers["X-RateLimit-Limit"] = limit.ToString();
+            context.Response.Headers["X-RateLimit-Remaining"] = remaining.ToString();
+            return Task.CompletedTask;
+        });
 
         await _next(context);
     }
 
-    private string GetClientIdentifier(HttpContext context)
+    private void CleanupIfDue(DateTime now, TimeSpan window)
     {
-        // Use API key if available, otherwise use IP
-        if (context.Items.TryGetValue("ApiKeyDescription", out var apiKey) && apiKey != null)
+        var last = Interlocked.Read(ref _lastCleanupTicks);
+        if (now.Ticks - last < TimeSpan.TicksPerMinute * 5) return;
+        if (Interlocked.CompareExchange(ref _lastCleanupTicks, now.Ticks, last) != last) return;
+
+        foreach (var (key, entry) in _clients)
         {
-            return $"key:{apiKey}";
-        }
-
-        var ip = context.Connection.RemoteIpAddress;
-        if (ip != null && ip.IsIPv4MappedToIPv6)
-        {
-            ip = ip.MapToIPv4();
-        }
-
-        return $"ip:{ip}";
-    }
-
-    private async Task CleanupExpiredEntriesAsync()
-    {
-        while (true)
-        {
-            await Task.Delay(TimeSpan.FromMinutes(5));
-
-            var cutoff = DateTime.UtcNow.AddSeconds(-_settings.RateLimitWindowSeconds * 2);
-            var keysToRemove = new List<string>();
-
-            foreach (var kvp in _clients)
+            lock (entry)
             {
-                lock (kvp.Value)
-                {
-                    if (kvp.Value.Requests.All(r => r < cutoff))
-                    {
-                        keysToRemove.Add(kvp.Key);
-                    }
-                }
-            }
-
-            foreach (var key in keysToRemove)
-            {
-                _clients.TryRemove(key, out _);
+                if (entry.Requests.All(r => r < now - window)) _clients.TryRemove(key, out _);
             }
         }
     }
