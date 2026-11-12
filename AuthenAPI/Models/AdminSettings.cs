@@ -11,7 +11,7 @@ public class AdminSettings
     public bool Enabled { get; set; } = true;
 
     /// <summary>
-    /// AD users (sAMAccountName, UPN or email) granted the Admin role
+    /// AD users (sAMAccountName or UPN; email is not accepted) granted the Admin role
     /// </summary>
     public List<string> AdminUsers { get; set; } = new();
 

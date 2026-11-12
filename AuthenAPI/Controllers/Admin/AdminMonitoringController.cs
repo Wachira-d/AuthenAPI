@@ -30,9 +30,10 @@ public class AdminMonitoringController : AdminControllerBase
         Ok(ApiResponse<List<HealthSample>>.Ok(_health.GetHistory(hours)));
 
     [HttpPost("health/check-now")]
+    [Microsoft.AspNetCore.Authorization.Authorize(Policy = AdminRoles.WritePolicy)]
     public async Task<IActionResult> CheckNow(CancellationToken cancellationToken)
     {
-        await _health.ProbeNowAsync(cancellationToken);
+        await _health.ProbeNowAsync(cancellationToken, minimumInterval: TimeSpan.FromSeconds(10));
         return Ok(ApiResponse<HealthReport>.Ok(_health.BuildReport(), "Health check completed"));
     }
 

@@ -19,6 +19,7 @@ const SCHEMA = {
     ['serviceAccountPassword', 'password'],
     ['connectionTimeout', 'number', { min: 1 }],
     ['skipCertificateValidation', 'bool', { hint: true, danger: true }],
+    ['allowInsecureFallback', 'bool', { hint: true, danger: true }],
     ['chaseReferrals', 'bool', { hint: true }],
     ['enableCache', 'bool'],
     ['cacheDurationMinutes', 'number', { min: 0 }],
@@ -215,6 +216,7 @@ export async function mount(root, ctx) {
         if (original.enableIpWhitelist && !next.enableIpWhitelist) checks.push(['set.c.ipOffTitle', 'set.c.ipOff']);
       }
       if (sec === 'ldap' && !original.skipCertificateValidation && next.skipCertificateValidation) checks.push(['set.c.skipCertTitle', 'set.c.skipCert']);
+      if (sec === 'ldap' && !original.allowInsecureFallback && next.allowInsecureFallback) checks.push(['set.c.insecureTitle', 'set.c.insecure']);
       if (sec === 'admin') checks.push(['set.c.adminTitle', 'set.c.admin']);
       for (const [title, msg] of checks) {
         // eslint-disable-next-line no-await-in-loop

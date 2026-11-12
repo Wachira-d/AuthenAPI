@@ -95,11 +95,17 @@ public sealed class HealthMonitorService : BackgroundService
     }
 
     /// <summary>Run a probe now (also used by "Check now" in the portal)</summary>
-    public async Task ProbeNowAsync(CancellationToken cancellationToken = default)
+    public async Task ProbeNowAsync(CancellationToken cancellationToken = default, TimeSpan? minimumInterval = null)
     {
         await _probeLock.WaitAsync(cancellationToken);
         try
         {
+            // Manual "check now" is throttled so it cannot be used to hammer the DC with binds.
+            if (minimumInterval.HasValue && _lastProbeAt.HasValue && DateTime.UtcNow - _lastProbeAt.Value < minimumInterval.Value)
+            {
+                return;
+            }
+
             var settings = _ldapSettings.CurrentValue;
             var portsTask = ProbePortsAsync(settings);
 

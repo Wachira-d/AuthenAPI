@@ -59,6 +59,10 @@ public class AdminAuthController : AdminControllerBase
                     Data = new { retryAfterSeconds = result.RetryAfterSeconds }
                 });
 
+            case AdminLoginStatus.Busy:
+                Response.Headers["Retry-After"] = result.RetryAfterSeconds.ToString();
+                return StatusCode(StatusCodes.Status429TooManyRequests, ApiResponse.Fail("Too many sign-ins in progress. Try again in a few seconds."));
+
             case AdminLoginStatus.NotAuthorized:
                 await AuditAsync(AuditAction.AdminLogin, false, "Valid AD credentials but no admin/viewer access", request.Username);
                 return StatusCode(StatusCodes.Status403Forbidden,

@@ -373,6 +373,14 @@ public partial class LdapService : ILdapService
         _logger.LogInformation("=== Starting Authentication for: {Username} ({Format}) ===",
             username, DetectUsernameFormat(username));
 
+        // The service account is not a user login: refusing it here also stops anyone holding an
+        // API key from locking it out (which would force every login onto the fallback path).
+        if (!string.IsNullOrEmpty(s.ServiceAccountUsername) &&
+            ExtractSamAccountName(username).Equals(ExtractSamAccountName(s.ServiceAccountUsername), StringComparison.OrdinalIgnoreCase))
+        {
+            return LdapAuthResult.Fail(AuthFailureReason.InvalidCredentials, "The service account cannot be used to sign in");
+        }
+
         // Step 1: resolve the user with the service account.
         UserInfo? directoryUser = null;
         var lookupCompleted = false;
@@ -583,6 +591,11 @@ public partial class LdapService : ILdapService
             primary = false;
         }
 
+        if (!AllowsInsecure(s))
+        {
+            strategies.RemoveAll(st => !st.Secure);
+        }
+
         var preferred = ignorePreferred ? null : _strategyCache.PreferredStrategy;
 
         // OrderBy is stable, so the declared order is kept within each group.
@@ -591,6 +604,13 @@ public partial class LdapService : ILdapService
             .ThenBy(st => _strategyCache.IsEndpointRecentlyDown(st.Server, st.Port, st.Ssl) ? 1 : 0)
             .ToList();
     }
+
+    /// <summary>
+    /// Clear-text simple binds are only allowed when the admin chose plain LDAP (UseSSL=false)
+    /// or explicitly opted in. Otherwise a TLS failure (e.g. an attacker's certificate) must not
+    /// silently downgrade to sending passwords in clear text.
+    /// </summary>
+    private static bool AllowsInsecure(LdapSettings s) => !s.UseSSL || s.AllowInsecureFallback;
 
     private static string TransportLabel(int port, bool ssl, bool seal) => (port, ssl, seal) switch
     {
@@ -672,7 +692,7 @@ public partial class LdapService : ILdapService
                     if (recordStats)
                     {
                         _strategyCache.RecordSuccess(strategy.Name, strategy.Server, strategy.Port, strategy.Ssl,
-                            strategy.Secure, sw.ElapsedMilliseconds, makePreferred: true);
+                            strategy.Secure, sw.ElapsedMilliseconds, makePreferred: serviceFingerprint != null);
                     }
                     attempts?.Add(new LdapAttempt { Strategy = $"{strategy.Name} as {name}", Success = true, LatencyMs = sw.ElapsedMilliseconds });
                     _logger.LogInformation("✓ LDAP bind OK - {Strategy} ({Server}:{Port}, secure={Secure}) as {Name} in {Ms}ms",
@@ -721,9 +741,9 @@ public partial class LdapService : ILdapService
 
                         // Definitive answer about an existing account. Stop now: every further
                         // attempt would add another bad-password count toward AD lockout.
-                        if (serviceFingerprint != null && reason == AuthFailureReason.InvalidCredentials)
+                        if (serviceFingerprint != null)
                         {
-                            _strategyCache.BlockServiceAccount(serviceFingerprint, description);
+                            _strategyCache.BlockServiceAccount(serviceFingerprint, $"{reason}: {description}");
                         }
                         _logger.LogWarning("✗ {Strategy} as {Name}: {Reason} - stopping to avoid account lockout",
                             strategy.Name, name, reason);
@@ -901,14 +921,14 @@ public partial class LdapService : ILdapService
     /// </summary>
     private static List<string> GetUsernameFormats(LdapSettings s, string username)
     {
-        // Canonical forms first. AD answers an unresolvable name (e.g. a bare "user") with the same
-        // "data 52e" as a wrong password, which would stop the attempt before a working form is tried.
+        // Only this domain's canonical names. Binding with the raw input ("OTHER\\user", "user@other")
+        // could authenticate an account in a trusted domain while the user record is then read from
+        // this domain by sAMAccountName, mixing up identities. Canonical forms are also what AD
+        // resolves reliably: an unresolvable name returns the same "data 52e" as a wrong password.
         var sam = ExtractSamAccountName(username);
         var formats = new List<string>();
-        if (username.Contains('\\')) formats.Add(username);
         if (!string.IsNullOrEmpty(NetBios(s))) formats.Add($"{NetBios(s)}\\{sam}");
         if (!string.IsNullOrEmpty(s.Domain)) formats.Add($"{sam}@{s.Domain}");
-        if (username.Contains('@')) formats.Add(username);
         return formats.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
     }
 
@@ -941,7 +961,14 @@ public partial class LdapService : ILdapService
         var downEndpoints = new HashSet<string>();
         var credentialsRejected = false;
 
-        foreach (var strategy in BuildStrategies(s, includeNegotiate: true, ignorePreferred: true))
+        var diagnosticStrategies = BuildStrategies(s, includeNegotiate: true, ignorePreferred: true);
+        if (!AllowsInsecure(s))
+        {
+            result.Hints.Add("Clear-text strategies (LDAP-389, LDAP-636-NoSSL, GC-3268) are not tried because UseSSL is on " +
+                             "and AllowInsecureFallback is off.");
+        }
+
+        foreach (var strategy in diagnosticStrategies)
         {
             var attempt = new ConnectionAttemptResult
             {

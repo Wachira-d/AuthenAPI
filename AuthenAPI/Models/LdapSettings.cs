@@ -32,6 +32,13 @@ public class LdapSettings
     public string? NetBiosDomain { get; set; }
 
     /// <summary>
+    /// When UseSSL is true, only encrypted strategies (LDAPS, or 389 signed+sealed) are used.
+    /// Set to true to also allow clear-text simple binds as a fallback. Insecure: anyone on the
+    /// network path can read passwords and impersonate the DC. Ignored when UseSSL is false.
+    /// </summary>
+    public bool AllowInsecureFallback { get; set; } = false;
+
+    /// <summary>
     /// Follow LDAP referrals to other domains during searches. Off by default because
     /// unreachable referral targets make searches hang until the timeout.
     /// </summary>

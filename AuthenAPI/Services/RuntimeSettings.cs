@@ -229,6 +229,7 @@ public static class SettingsMapper
         ServiceAccountPasswordSet = !string.IsNullOrEmpty(s.ServiceAccountPassword),
         ConnectionTimeout = s.ConnectionTimeout,
         SkipCertificateValidation = s.SkipCertificateValidation,
+        AllowInsecureFallback = s.AllowInsecureFallback,
         ChaseReferrals = s.ChaseReferrals,
         EnableCache = s.EnableCache,
         CacheDurationMinutes = s.CacheDurationMinutes
@@ -246,6 +247,7 @@ public static class SettingsMapper
         s.ServiceAccountUsername = d.ServiceAccountUsername.Trim();
         s.ConnectionTimeout = d.ConnectionTimeout;
         s.SkipCertificateValidation = d.SkipCertificateValidation;
+        s.AllowInsecureFallback = d.AllowInsecureFallback;
         s.ChaseReferrals = d.ChaseReferrals;
         s.EnableCache = d.EnableCache;
         s.CacheDurationMinutes = d.CacheDurationMinutes;

@@ -16,7 +16,7 @@ audit event, and run LDAP diagnostics — without editing files on the server.
 | Audit Logs | Existing audit trail plus admin actions (login, key changes, settings changes). Filter, CSV export |
 | Settings | Edit LDAP, Security, Audit and Admin settings at runtime; "Test before save" for LDAP; revert a section to `appsettings.json`; automatic backup of every change |
 | Tools | Full LDAP diagnostics, test a user login (shows failure reason: bad password / locked / disabled / expired), user lookup, clear cache, reset preferred LDAP strategy, per-strategy statistics |
-| Security | Cookie session (HttpOnly, SameSite=Strict), CSRF header, roles Admin/Viewer, login lockout, AD-group or user-list based access, local break-glass admin when AD is down |
+| Security | Cookie session (HttpOnly, SameSite=Strict, 12-hour absolute lifetime), CSRF header, Admin/Viewer roles, atomic login lockout (per user+IP, per user, per IP), access by AD group or user list with group membership re-checked every 10 minutes, local break-glass admin for when AD is down |
 
 ## 2. Conventions
 
@@ -142,7 +142,7 @@ PUT returns the updated section DTO. `overridden.x = true` means the section has
 // LdapSettingsDto — serviceAccountPassword is write-only: GET returns "" and serviceAccountPasswordSet; PUT with ""/null keeps the current password
 { "server": "", "fallbackServers": [], "port": 636, "useSSL": true, "baseDN": "", "domain": "",
   "netBiosDomain": null, "serviceAccountUsername": "", "serviceAccountPassword": "", "serviceAccountPasswordSet": true,
-  "connectionTimeout": 10, "skipCertificateValidation": false, "chaseReferrals": false,
+  "connectionTimeout": 10, "skipCertificateValidation": false, "allowInsecureFallback": false, "chaseReferrals": false,
   "enableCache": true, "cacheDurationMinutes": 5 }
 // SecuritySettingsDto
 { "enableIpWhitelist": true, "allowedIpAddresses": [], "enableApiKeyAuth": true, "apiKeyHeaderName": "X-API-Key",
@@ -183,6 +183,7 @@ See section "Admin Portal" in `docs/IIS_DEPLOYMENT_GUIDE.md` (data folder permis
 1. The service account looks the user up by `sAMAccountName`, `userPrincipalName` or `mail`. This works for every input format: `user`, `DOMAIN\user`, UPN and email.
 2. The user is bound **once** with the directory's own UPN (or DN). A wrong password therefore adds exactly one to AD's `badPwdCount`. Unknown and disabled users cost no bind at all.
 3. The working connection strategy is cached and tried first. Endpoints that are unreachable are skipped for the rest of the call. Every 15 minutes the health monitor re-tries the most secure strategies, so a fixed LDAPS certificate is picked up automatically.
-4. Strategy order: configured port, then `LDAPS-636`, `GC-SSL-3269`, `LDAP-389-Sealed` (Kerberos/NTLM signed and sealed, encrypted without a certificate), `LDAP-636-NoSSL`, `LDAP-389` (clear text), `GC-3268`.
+4. Strategy order: configured port, then `LDAPS-636`, `GC-SSL-3269`, `LDAP-389-Sealed` (Kerberos/NTLM signed and sealed, encrypted without a certificate), `LDAP-636-NoSSL`, `LDAP-389` (clear text), `GC-3268`. **With `UseSSL=true`, the clear-text strategies are only used when `AllowInsecureFallback=true`.** Otherwise a TLS failure, for example an attacker presenting their own certificate, cannot downgrade the connection to clear text.
+7. Changing the server, port, TLS options or service account requires re-entering the service-account password. This prevents the stored password from being sent to a new host.
 5. If AD rejects the service account password, service binds pause for 15 minutes, so the health probe cannot lock the account. Saving new LDAP settings clears the pause.
 6. If the directory can't be searched, the fallback is a direct bind (`DOMAIN\user`, then `user@domain`) that stops at the first definitive answer. If no endpoint is reachable at all, Windows `PrincipalContext` gets one attempt.

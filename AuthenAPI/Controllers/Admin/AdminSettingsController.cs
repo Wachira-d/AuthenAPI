@@ -47,6 +47,7 @@ public class AdminSettingsController : AdminControllerBase
     public async Task<IActionResult> PutLdap([FromBody] LdapSettingsDto dto)
     {
         var errors = SettingsMapper.Validate(dto);
+        errors.AddRange(RequirePasswordForNewEndpoint(dto));
         if (errors.Count > 0) return Invalid(errors);
 
         var before = SettingsMapper.ToDto(_ldap.CurrentValue);
@@ -144,6 +145,7 @@ public class AdminSettingsController : AdminControllerBase
     public async Task<IActionResult> TestLdap([FromBody] LdapSettingsDto dto, [FromServices] ILdapService ldap)
     {
         var errors = SettingsMapper.Validate(dto);
+        errors.AddRange(RequirePasswordForNewEndpoint(dto));
         if (errors.Count > 0) return Invalid(errors);
 
         var candidate = new LdapSettings
@@ -158,6 +160,33 @@ public class AdminSettingsController : AdminControllerBase
         await AuditAsync(AuditAction.AdminTool, result.Success,
             $"Tested LDAP settings for {candidate.Server}:{candidate.Port}: {(result.Success ? "OK via " + result.Strategy : result.Error)}");
         return Ok(ApiResponse<LdapTestResult>.Ok(result, result.Success ? "Connection test passed" : "Connection test failed"));
+    }
+
+    /// <summary>
+    /// The stored service-account password may only be reused for the endpoint it was saved for.
+    /// Otherwise an admin (or a stolen admin session) could point the server at a host they control
+    /// and receive the password in clear text.
+    /// </summary>
+    private List<string> RequirePasswordForNewEndpoint(LdapSettingsDto dto)
+    {
+        if (!string.IsNullOrEmpty(dto.ServiceAccountPassword)) return new List<string>();
+
+        var current = _ldap.CurrentValue;
+        static string Norm(IEnumerable<string> xs) =>
+            string.Join("|", xs.Select(x => x.Trim().ToLowerInvariant()).Where(x => x.Length > 0).OrderBy(x => x));
+
+        var endpointChanged =
+            !dto.Server.Trim().Equals(current.Server.Trim(), StringComparison.OrdinalIgnoreCase) ||
+            Norm(dto.FallbackServers) != Norm(current.FallbackServers) ||
+            dto.Port != current.Port ||
+            dto.UseSSL != current.UseSSL ||
+            dto.SkipCertificateValidation != current.SkipCertificateValidation ||
+            dto.AllowInsecureFallback != current.AllowInsecureFallback ||
+            !dto.ServiceAccountUsername.Trim().Equals(current.ServiceAccountUsername.Trim(), StringComparison.OrdinalIgnoreCase);
+
+        return endpointChanged
+            ? new List<string> { "serviceAccountPassword: re-enter the service account password when changing the server, port, TLS settings or account" }
+            : new List<string>();
     }
 
     private SettingsOverview BuildOverview()

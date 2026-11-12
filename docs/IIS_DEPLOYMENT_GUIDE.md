@@ -156,7 +156,7 @@ icacls "D:\Web Sites\wwwroot\AuthenAPI\logs" /grant "IIS AppPool\AuthenAPIPool:(
 }
 ```
 
-- `AdminUsers` / `ViewerUsers` ใส่ได้ทั้ง sAMAccountName, UPN หรือ email
+- `AdminUsers` / `ViewerUsers` ใส่ sAMAccountName หรือ UPN (ไม่รองรับ email เพราะ attribute mail แก้ไขได้ง่ายกว่า)
 - `AdminGroups` / `ViewerGroups` คือชื่อ group ใน AD (นับเฉพาะ direct member ไม่รวม nested group)
 - `AllowedIpAddresses` จำกัด IP ที่เปิดหน้า admin ได้ (ว่าง = ใช้ whitelist หลัก) — จาก server เอง (127.0.0.1) เข้าได้เสมอ
 

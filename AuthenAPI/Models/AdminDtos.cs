@@ -34,6 +34,7 @@ public class LdapSettingsDto
 
     public int ConnectionTimeout { get; set; } = 10;
     public bool SkipCertificateValidation { get; set; }
+    public bool AllowInsecureFallback { get; set; }
     public bool ChaseReferrals { get; set; }
     public bool EnableCache { get; set; } = true;
     public int CacheDurationMinutes { get; set; } = 5;
