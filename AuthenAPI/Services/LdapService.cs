@@ -457,35 +457,51 @@ public partial class LdapService : ILdapService
             };
         }
 
-        // Step 3: the directory could not be searched; try direct binds (simple binds report AD sub-codes reliably).
-        var formats = GetUsernameFormats(s, username);
-        var direct = TryBind(s, BuildStrategies(s, includeNegotiate: false), formats, password,
-            serviceFingerprint: null, attempts: null, recordStats: true);
-
-        if (direct.Success)
+        // Step 3: the directory could not be searched; try direct binds, one name format at a time.
+        // AD answers a name it cannot resolve (wrong UPN suffix, wrong NetBIOS domain) with the same
+        // "data 52e" as a wrong password, so a 52e only moves on to the next format (at most 3 binds,
+        // so a real wrong password can add at most 3 bad-password counts on this rare path).
+        // Any other definitive answer (locked, disabled, expired...) stops immediately.
+        _logger.LogWarning("Falling back to direct bind for {Username}: the service account could not look the user up", username);
+        var strategies = BuildStrategies(s, includeNegotiate: false);
+        BindOutcome? last = null;
+        foreach (var name in GetUsernameFormats(s, username))
         {
-            UserInfo? user = null;
-            using (direct.Connection)
+            var direct = TryBind(s, strategies, new[] { name }, password, serviceFingerprint: null, attempts: null, recordStats: true);
+            last = direct;
+
+            if (direct.Success)
             {
-                try
+                UserInfo? user = null;
+                using (direct.Connection)
                 {
-                    // Authenticated users can normally read their own entry.
-                    user = SearchUser(direct.Connection!, s, username, out _);
+                    try
+                    {
+                        // Read the entry of the account that actually bound, never a same-named account elsewhere.
+                        user = SearchBoundIdentity(direct.Connection!, s, name);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug("Could not read own entry after direct bind: {Error}", ex.Message);
+                    }
                 }
-                catch (Exception ex)
-                {
-                    _logger.LogDebug("Could not read own entry after direct bind: {Error}", ex.Message);
-                }
+
+                user ??= BasicUserInfo(username, name);
+                CacheAuthenticatedUser(user);
+                return new LdapAuthResult { Success = true, User = user, Method = "DirectBind", Strategy = direct.Strategy?.Name };
             }
 
-            user ??= BasicUserInfo(username, direct.BoundAs);
-            CacheAuthenticatedUser(user);
-            return new LdapAuthResult { Success = true, User = user, Method = "DirectBind", Strategy = direct.Strategy?.Name };
+            if (!direct.ReachedDirectory) break; // no DC reachable: other names won't help
+            if (direct.FailureReason is not (AuthFailureReason.InvalidCredentials or AuthFailureReason.UserNotFound))
+            {
+                return WithMethod(LdapAuthResult.Fail(direct.FailureReason, direct.ErrorMessage), "DirectBind", direct.Strategy?.Name);
+            }
+            _logger.LogInformation("Direct bind as {Name} rejected ({Reason}); trying the next username format", name, direct.FailureReason);
         }
 
-        if (direct.ReachedDirectory)
+        if (last is { ReachedDirectory: true })
         {
-            return WithMethod(LdapAuthResult.Fail(direct.FailureReason, direct.ErrorMessage), "DirectBind", direct.Strategy?.Name);
+            return WithMethod(LdapAuthResult.Fail(last.FailureReason, last.ErrorMessage), "DirectBind", last.Strategy?.Name);
         }
 
         // Step 4: no LDAP endpoint answered at all; Windows PrincipalContext is the last resort.
@@ -922,15 +938,37 @@ public partial class LdapService : ILdapService
     /// </summary>
     private static List<string> GetUsernameFormats(LdapSettings s, string username)
     {
-        // Only this domain's canonical names. Binding with the raw input ("OTHER\\user", "user@other")
-        // could authenticate an account in a trusted domain while the user record is then read from
-        // this domain by sAMAccountName, mixing up identities. Canonical forms are also what AD
-        // resolves reliably: an unresolvable name returns the same "data 52e" as a wrong password.
+        // The typed UPN/email first (UPN suffixes such as @ipsos.com often differ from the AD domain),
+        // then this domain's canonical forms. After a successful bind the user record is read by the
+        // exact bound name (SearchBoundIdentity), so a same-named account in another domain is never mixed in.
         var sam = ExtractSamAccountName(username);
         var formats = new List<string>();
-        if (!string.IsNullOrEmpty(NetBios(s))) formats.Add($"{NetBios(s)}\\{sam}");
+        if (username.Contains('@')) formats.Add(username);
         if (!string.IsNullOrEmpty(s.Domain)) formats.Add($"{sam}@{s.Domain}");
-        return formats.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        if (!string.IsNullOrEmpty(NetBios(s))) formats.Add($"{NetBios(s)}\\{sam}");
+        return formats.Distinct(StringComparer.OrdinalIgnoreCase).Take(3).ToList();
+    }
+
+    /// <summary>Look up exactly the account a direct bind authenticated as</summary>
+    private UserInfo? SearchBoundIdentity(LdapConnection connection, LdapSettings s, string boundAs)
+    {
+        string filter;
+        if (boundAs.Contains('@'))
+        {
+            filter = $"(&(objectClass=user)(objectCategory=person)(userPrincipalName={EscapeLdapFilter(boundAs)}))";
+        }
+        else if (boundAs.Contains('\\') && boundAs.Split('\\')[0].Equals(NetBios(s), StringComparison.OrdinalIgnoreCase))
+        {
+            filter = $"(&(objectClass=user)(objectCategory=person)(sAMAccountName={EscapeLdapFilter(ExtractSamAccountName(boundAs))}))";
+        }
+        else
+        {
+            return null;
+        }
+
+        var request = new System.DirectoryServices.Protocols.SearchRequest(s.BaseDN, filter, SearchScope.Subtree, UserAttributes) { TimeLimit = SearchTimeout };
+        var response = (SearchResponse)connection.SendRequest(request, SearchTimeout);
+        return response.Entries.Count == 1 ? MapEntryToUserInfo(response.Entries[0]) : null;
     }
 
     #endregion
