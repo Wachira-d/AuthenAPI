@@ -199,6 +199,13 @@ app.Use(async (context, next) =>
 
     // "/admin" -> "/admin/" so relative asset paths resolve. Not a routed endpoint: routing treats
     // "/admin/" as the same route, which would stop the static-file middleware from serving index.html.
+    // Site root has no page of its own: send people to the admin portal.
+    if (context.Request.Path == "/" && HttpMethods.IsGet(context.Request.Method))
+    {
+        context.Response.Redirect("/admin/");
+        return;
+    }
+
     if (context.Request.Path.Equals("/admin", StringComparison.OrdinalIgnoreCase))
     {
         context.Response.Redirect("/admin/");
