@@ -208,12 +208,17 @@ public partial class LdapService : ILdapService
     }
 
     /// <inheritdoc />
-    public async Task<UserInfo?> GetUserAsync(string username)
+    public Task<UserInfo?> GetUserAsync(string username) => GetUserCoreAsync(username, useCache: true);
+
+    /// <inheritdoc />
+    public Task<UserInfo?> GetUserFreshAsync(string username) => GetUserCoreAsync(username, useCache: false);
+
+    private async Task<UserInfo?> GetUserCoreAsync(string username, bool useCache)
     {
         if (string.IsNullOrWhiteSpace(username)) return null;
 
         var cacheKey = $"{UserCachePrefix}{username.ToLowerInvariant()}";
-        if (_settings.EnableCache && _cache.TryGetValue(cacheKey, out UserInfo? cachedUser))
+        if (useCache && _settings.EnableCache && _cache.TryGetValue(cacheKey, out UserInfo? cachedUser))
         {
             return cachedUser;
         }

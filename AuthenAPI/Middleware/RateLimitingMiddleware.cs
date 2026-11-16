@@ -35,6 +35,7 @@ public class RateLimitingMiddleware
 
         if (!settings.EnableRateLimiting ||
             context.IsAdminPath() ||
+            context.IsSsoPath() ||
             settings.ExcludedPaths.Any(p => path.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
         {
             await _next(context);

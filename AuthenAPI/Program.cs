@@ -153,6 +153,9 @@ builder.Services.AddAuthorization(options =>
         .RequireRole(AdminRoles.Admin));
 });
 
+// Single sign-on (OpenID Connect provider)
+builder.AddSso();
+
 builder.Services.AddControllers()
     .AddJsonOptions(o => o.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 
@@ -223,6 +226,12 @@ app.Use(async (context, next) =>
 
     // "/admin" -> "/admin/" so relative asset paths resolve. Not a routed endpoint: routing treats
     // "/admin/" as the same route, which would stop the static-file middleware from serving index.html.
+    if (context.Request.Path.Equals("/favicon.ico", StringComparison.OrdinalIgnoreCase))
+    {
+        context.Response.Redirect("/favicon.svg", permanent: true);
+        return;
+    }
+
     // Site root has no page of its own: send people to the admin portal.
     if (context.Request.Path == "/" && HttpMethods.IsGet(context.Request.Method))
     {

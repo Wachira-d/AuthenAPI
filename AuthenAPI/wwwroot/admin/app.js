@@ -4,6 +4,7 @@ import { configureApi, get, post, ApiError } from './api.js';
 import { h, replace, clear, toast, closeAllModals, healthBadge, confirmDialog, fmtSeconds, visibleInterval } from './ui.js';
 import * as dashboard from './view-dashboard.js';
 import * as keys from './view-keys.js';
+import * as sso from './view-sso.js';
 import * as logs from './view-logs.js';
 import * as settings from './view-settings.js';
 import * as tools from './view-tools.js';
@@ -11,6 +12,7 @@ import * as tools from './view-tools.js';
 const ROUTES = {
   dashboard: { label: 'nav.dashboard', icon: 'M3 13h8V3H3zm0 8h8v-6H3zm10 0h8V11h-8zm0-18v6h8V3z', mount: dashboard.mount },
   keys: { label: 'nav.keys', icon: 'M7 14a4 4 0 1 1 3.9-5H21v4h-2v3h-3v-3h-5.1A4 4 0 0 1 7 14zm0-2a2 2 0 1 0 0-4 2 2 0 0 0 0 4z', mount: keys.mount },
+  sso: { label: 'nav.sso', icon: 'M4 4h7v7H4zm9 0h7v7h-7zM4 13h7v7H4zm12 0h2v3h3v2h-3v3h-2v-3h-3v-2h3z', mount: sso.mount },
   requests: { label: 'nav.requests', icon: 'M4 5h16v2H4zm0 6h16v2H4zm0 6h10v2H4z', mount: logs.mountRequests },
   audit: { label: 'nav.audit', icon: 'M12 2 4 5v6c0 5 3.4 9.7 8 11 4.6-1.3 8-6 8-11V5zm-1 14-4-4 1.4-1.4L11 13.2l5.6-5.6L18 9z', mount: logs.mountAudit },
   settings: { label: 'nav.settings', icon: 'M19.4 13a7.5 7.5 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7 7 0 0 0-1.7-1L15 3.5h-4L10.7 6a7 7 0 0 0-1.7 1l-2.4-1-2 3.4 2 1.6a7.5 7.5 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7 7 0 0 0 1.7 1l.3 2.5h4l.3-2.5a7 7 0 0 0 1.7-1l2.4 1 2-3.4zM13 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z', mount: settings.mount },

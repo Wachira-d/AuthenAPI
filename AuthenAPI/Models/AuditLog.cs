@@ -120,7 +120,16 @@ public enum AuditAction
     ApiKeyRevoked,
     ApiKeyDeleted,
     SettingsChanged,
-    AdminTool
+    AdminTool,
+
+    // Single sign-on
+    SsoLogin,
+    SsoLogout,
+    SsoClientCreated,
+    SsoClientUpdated,
+    SsoClientSecretRotated,
+    SsoClientDeleted,
+    SsoAuthorize
 }
 
 /// <summary>

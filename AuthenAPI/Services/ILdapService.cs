@@ -45,6 +45,12 @@ public interface ILdapService
     Task<UserInfo?> GetUserAsync(string username);
 
     /// <summary>
+    /// Get user information straight from AD, bypassing the cache. Use for security decisions
+    /// (is the account still enabled / still in the group). Null when not found or AD is unreachable.
+    /// </summary>
+    Task<UserInfo?> GetUserFreshAsync(string username);
+
+    /// <summary>
     /// Search users in Active Directory
     /// </summary>
     Task<List<UserInfo>> SearchUsersAsync(SearchRequest request);

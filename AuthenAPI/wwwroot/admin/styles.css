@@ -528,3 +528,30 @@ td.actions .btn-row { flex-wrap: nowrap; }
 .keys-table .tbl tr.row-dim td { opacity: 1; }
 .keys-table .tbl tr.row-dim td:not(.actions) > * { opacity: 0.55; }
 .keys-table .tbl th { white-space: normal; }
+
+/* ---------- SSO applications ---------- */
+.badge-accent { background: var(--accent-wash); color: var(--accent-ink); }
+.badge-accent .badge-icon { background: var(--accent); }
+.kv-urls { grid-template-columns: minmax(160px, max-content) 1fr; align-items: center; }
+.url-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.url-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.sso-info .head-badges { justify-content: flex-end; }
+.sso-table .tbl td.uri-cell { white-space: normal; min-width: 150px; max-width: 190px; }
+.sso-table .truncate { max-width: 260px; }
+.uri-details summary { cursor: pointer; display: flex; align-items: baseline; gap: 6px; list-style: none; }
+.uri-details summary::-webkit-details-marker { display: none; }
+.uri-details summary::before { content: "▸"; color: var(--muted); font-size: 11px; }
+.uri-details[open] summary::before { content: "▾"; }
+.uri-details summary .truncate { max-width: 130px; }
+.uri-list { margin: 4px 0 0; padding-left: 16px; display: flex; flex-direction: column; gap: 2px; }
+.uri-list li { overflow-wrap: anywhere; }
+.type-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 14px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; }
+.type-option > span { display: flex; flex-direction: column; gap: 1px; }
+.type-option input:disabled + span { opacity: 0.7; }
+.snippet-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 4px; }
+.snippet { white-space: pre; overflow-x: auto; word-break: normal; }
+.sso-table .client-id { white-space: nowrap; }
+.sso-table .tbl td.uri-cell .truncate { max-width: 100%; }
+.sso-table .tbl td.wrap-cell { min-width: 120px; max-width: 180px; }
+.type-cell { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
+.uri-details summary .muted { white-space: nowrap; }

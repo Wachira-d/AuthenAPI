@@ -49,7 +49,7 @@ public class IpWhitelistMiddleware
         }
 
         var excluded = settings.ExcludedPaths.Any(p => path.StartsWith(p, StringComparison.OrdinalIgnoreCase));
-        if (!settings.EnableIpWhitelist || excluded || isLoopback)
+        if (!settings.EnableIpWhitelist || excluded || isLoopback || context.IsSsoPath())
         {
             await _next(context);
             return;

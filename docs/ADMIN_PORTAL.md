@@ -200,3 +200,35 @@ See section "Admin Portal" in `docs/IIS_DEPLOYMENT_GUIDE.md` (data folder permis
 
 - The schema is in `AuthenAPI/Data/DatabaseSchema.sql` and is copied to `docs/sql/`. It is idempotent and runs at startup.
 - Other servers pick up changes within 30 s. Retention: `AuditSettings.RetentionDays` and `RequestLogRetentionDays`, purged daily.
+
+## 7. SSO applications (OpenID Connect clients)
+
+| Method | Path | Body | `data` |
+|---|---|---|---|
+| GET | `/api/admin/sso/info` | – | `SsoInfo` |
+| GET | `/api/admin/sso/clients` | – | `SsoClientView[]` |
+| POST | `/api/admin/sso/clients` **[Admin]** | `SsoClientInput` | `{ client: SsoClientView, clientSecret: string\|null }`: the secret is shown ONCE (null for public clients) |
+| PUT | `/api/admin/sso/clients/{clientId}` **[Admin]** | `SsoClientInput` (`clientId` and `type` are ignored) | `SsoClientView` |
+| POST | `/api/admin/sso/clients/{clientId}/rotate-secret` **[Admin]** | – | `{ client, clientSecret }`: the old secret stops working immediately |
+| DELETE | `/api/admin/sso/clients/{clientId}` **[Admin]** | – | null |
+
+```jsonc
+// SsoInfo
+{ "enabled": true, "issuer": "https://authen.hondacx.me/", "discoveryUrl": ".../.well-known/openid-configuration",
+  "authorizeUrl": ".../connect/authorize", "tokenUrl": ".../connect/token", "userinfoUrl": ".../connect/userinfo",
+  "logoutUrl": ".../connect/logout", "loginPageUrl": ".../sso/login", "sessionHours": 8,
+  "scopes": ["openid","profile","email","groups"], "claims": ["sub","name","preferred_username","email","given_name","family_name","upn","groups","department","employee_id"],
+  "activeSessions": 0 }
+// SsoClientInput
+{ "clientId": "coupon",                      // create only; ^[a-z0-9][a-z0-9._-]{1,63}$
+  "displayName": "Coupon",                   // shown on the login page
+  "type": "confidential",                    // "confidential" (server-side app, has secret) | "public" (SPA/mobile, PKCE, no secret)
+  "redirectUris": ["https://coupon.hondacx.me/signin-oidc"],              // exact match, https (http only for localhost)
+  "postLogoutRedirectUris": ["https://coupon.hondacx.me/signout-callback-oidc"],
+  "frontChannelLogoutUri": "https://coupon.hondacx.me/signout-oidc",     // optional: called in a hidden iframe on single logout
+  "allowedGroups": [],                       // empty = every AD user; otherwise user must be a direct member of one
+  "requirePkce": true, "isActive": true }
+// SsoClientView = SsoClientInput fields + 
+{ "createdAt": "…", "createdBy": "…", "updatedAt": "…", "secretRotatedAt": "…", "lastLoginAt": "…", "loginCount": 0 }
+```
+Validation errors: 400 with `error` = "; "-joined messages (same as other admin endpoints). Audit actions added: `SsoLogin, SsoLogout, SsoClientCreated, SsoClientUpdated, SsoClientSecretRotated, SsoClientDeleted`.

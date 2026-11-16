@@ -20,8 +20,12 @@ public class RequestLogMiddleware
     public async Task InvokeAsync(HttpContext context, RequestLogService requestLog)
     {
         var path = context.Request.Path;
-        if (!path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase) ||
-            path.StartsWithSegments("/api/admin", StringComparison.OrdinalIgnoreCase))
+        var isApi = path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase) &&
+                    !path.StartsWithSegments("/api/admin", StringComparison.OrdinalIgnoreCase);
+        // SSO: log the protocol endpoints and login submissions, not static assets or page views.
+        var isSso = path.StartsWithSegments("/connect", StringComparison.OrdinalIgnoreCase) ||
+                    (path.Equals("/sso/login", StringComparison.OrdinalIgnoreCase) && HttpMethods.IsPost(context.Request.Method));
+        if (!isApi && !isSso)
         {
             await _next(context);
             return;

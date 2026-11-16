@@ -25,6 +25,13 @@ public class RuntimeSettingsHistoryRow
     public string? ChangedBy { get; set; }
 }
 
+public class SsoKeyRow
+{
+    public int Id { get; set; } = 1;
+    public string ProtectedJson { get; set; } = string.Empty;
+    public DateTime CreatedAt { get; set; }
+}
+
 public class AuthenDbContext : DbContext
 {
     public AuthenDbContext(DbContextOptions<AuthenDbContext> options) : base(options) { }
@@ -34,6 +41,8 @@ public class AuthenDbContext : DbContext
     public DbSet<RuntimeSettingsHistoryRow> RuntimeSettingsHistory => Set<RuntimeSettingsHistoryRow>();
     public DbSet<RequestLogEntry> RequestLogs => Set<RequestLogEntry>();
     public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
+    public DbSet<SsoClient> SsoClients => Set<SsoClient>();
+    public DbSet<SsoKeyRow> SsoKeys => Set<SsoKeyRow>();
 
     protected override void OnModelCreating(ModelBuilder b)
     {
@@ -51,6 +60,22 @@ public class AuthenDbContext : DbContext
             e.HasKey(x => x.Id);
             e.Property(x => x.Scopes).HasConversion(listConverter, listComparer);
             e.Property(x => x.AllowedIps).HasConversion(listConverter, listComparer);
+        });
+
+        b.Entity<SsoClient>(e =>
+        {
+            e.ToTable("SsoClients");
+            e.HasKey(x => x.ClientId);
+            e.Property(x => x.RedirectUris).HasConversion(listConverter, listComparer);
+            e.Property(x => x.PostLogoutRedirectUris).HasConversion(listConverter, listComparer);
+            e.Property(x => x.AllowedGroups).HasConversion(listConverter, listComparer);
+        });
+
+        b.Entity<SsoKeyRow>(e =>
+        {
+            e.ToTable("SsoKeys");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedNever();
         });
 
         b.Entity<RuntimeSettingsRow>(e =>

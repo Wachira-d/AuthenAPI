@@ -97,3 +97,35 @@ END
 
 IF NOT EXISTS (SELECT 1 FROM dbo.SchemaVersion WHERE Version = 1)
     INSERT INTO dbo.SchemaVersion (Version) VALUES (1);
+
+-- v2: single sign-on
+IF OBJECT_ID(N'dbo.SsoClients', N'U') IS NULL
+    CREATE TABLE dbo.SsoClients (
+        ClientId               nvarchar(64)   NOT NULL CONSTRAINT PK_SsoClients PRIMARY KEY,
+        DisplayName            nvarchar(100)  NOT NULL,
+        Type                   nvarchar(20)   NOT NULL,
+        SecretHash             nvarchar(64)   NULL,
+        RedirectUris           nvarchar(max)  NOT NULL,
+        PostLogoutRedirectUris nvarchar(max)  NOT NULL,
+        FrontChannelLogoutUri  nvarchar(1000) NULL,
+        AllowedGroups          nvarchar(max)  NOT NULL,
+        RequirePkce            bit            NOT NULL,
+        IsActive               bit            NOT NULL,
+        CreatedAt              datetime2      NOT NULL,
+        CreatedBy              nvarchar(256)  NULL,
+        UpdatedAt              datetime2      NULL,
+        UpdatedBy              nvarchar(256)  NULL,
+        SecretRotatedAt        datetime2      NULL,
+        LastLoginAt            datetime2      NULL,
+        LoginCount             bigint         NOT NULL CONSTRAINT DF_SsoClients_LoginCount DEFAULT 0
+    );
+
+IF OBJECT_ID(N'dbo.SsoKeys', N'U') IS NULL
+    CREATE TABLE dbo.SsoKeys (
+        Id            int            NOT NULL CONSTRAINT PK_SsoKeys PRIMARY KEY,
+        ProtectedJson nvarchar(max)  NOT NULL,
+        CreatedAt     datetime2      NOT NULL
+    );
+
+IF NOT EXISTS (SELECT 1 FROM dbo.SchemaVersion WHERE Version = 2)
+    INSERT INTO dbo.SchemaVersion (Version) VALUES (2);

@@ -32,7 +32,8 @@ public sealed class AdminLoginResult
 /// </summary>
 public sealed class LoginAttemptTracker
 {
-    private const int MaxFailuresPerIp = 20;
+    /// <summary>Failures per client IP before that IP is locked out (admin: 20; SSO login: higher, offices share NAT IPs)</summary>
+    public int MaxFailuresPerIp { get; init; } = 20;
     private const int UsernameAcrossIpsFactor = 4;
     private readonly Dictionary<string, Attempts> _attempts = new();
     private readonly object _lock = new();
@@ -102,7 +103,7 @@ public sealed class LoginAttemptTracker
         }
     }
 
-    private static (string Key, int Limit)[] Keys(string username, string ip, int perUser) => new[]
+    private (string Key, int Limit)[] Keys(string username, string ip, int perUser) => new[]
     {
         (PairKey(username, ip), perUser),
         ($"user|{username.ToLowerInvariant()}", perUser * UsernameAcrossIpsFactor),
@@ -341,7 +342,7 @@ public sealed class AdminAuthService
 
         if (stillValid && source == "group" && IsOlderThan(principal, ClaimCheckedAt, GroupRecheckInterval))
         {
-            var user = await services.GetRequiredService<ILdapService>().GetUserAsync(name);
+            var user = await services.GetRequiredService<ILdapService>().GetUserFreshAsync(name);
             stillValid = user is { IsEnabled: true } &&
                          ResolveRole(settings, DirectoryIdentities(user), user.Groups).Role == role;
 

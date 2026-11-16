@@ -32,6 +32,7 @@ public class ApiKeyAuthMiddleware
 
         if (!settings.EnableApiKeyAuth ||
             context.IsAdminPath() ||
+            context.IsSsoPath() ||
             settings.ExcludedPaths.Any(p => path.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
         {
             await _next(context);
