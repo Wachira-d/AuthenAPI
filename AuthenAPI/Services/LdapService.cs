@@ -1197,22 +1197,42 @@ public partial class LdapService : ILdapService
     /// The filter matches sAMAccountName OR userPrincipalName OR mail, so two different accounts can match
     /// (e.g. one user's mail equals another user's UPN). Prefer the attribute that matches the input style.
     /// </summary>
-    private static UserInfo ChooseBestMatch(List<UserInfo> users, string input)
+    private UserInfo? ChooseBestMatch(List<UserInfo> users, string input)
     {
         if (users.Count == 1) return users[0];
 
         var sam = ExtractSamAccountName(input);
         bool Eq(string? a, string b) => string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+        bool UpnPrefix(string? upn) => upn != null && upn.StartsWith(input + "@", StringComparison.OrdinalIgnoreCase);
 
+        UserInfo? match;
         if (input.Contains('@'))
         {
-            return users.FirstOrDefault(u => Eq(u.UserPrincipalName, input))
-                   ?? users.FirstOrDefault(u => Eq(u.Email, input))
-                   ?? users.FirstOrDefault(u => Eq(u.SamAccountName, sam))
-                   ?? users[0];
+            match = users.FirstOrDefault(u => Eq(u.UserPrincipalName, input))
+                    ?? Single(users.Where(u => Eq(u.Email, input)))
+                    ?? Single(users.Where(u => Eq(u.SamAccountName, sam)));
+        }
+        else
+        {
+            // Exact sAMAccountName wins; otherwise the UPN prefix must identify exactly one account.
+            match = users.FirstOrDefault(u => Eq(u.SamAccountName, sam))
+                    ?? Single(users.Where(u => UpnPrefix(u.UserPrincipalName)))
+                    ?? Single(users.Where(u => UpnPrefix(u.Email)));
         }
 
-        return users.FirstOrDefault(u => Eq(u.SamAccountName, sam)) ?? users[0];
+        if (match == null)
+        {
+            // Never guess: binding as the wrong person would count a bad password against their account.
+            _logger.LogWarning("'{Input}' matches {Count} accounts ({Accounts}); ask the user to sign in with the full UPN or email",
+                input, users.Count, string.Join(", ", users.Select(u => u.UserPrincipalName ?? u.SamAccountName)));
+        }
+        return match;
+
+        static UserInfo? Single(IEnumerable<UserInfo> candidates)
+        {
+            var list = candidates.Take(2).ToList();
+            return list.Count == 1 ? list[0] : null;
+        }
     }
 
     private void CacheUserInfo(string key, UserInfo userInfo)
@@ -1251,7 +1271,15 @@ public partial class LdapService : ILdapService
     {
         var sam = EscapeLdapFilter(ExtractSamAccountName(username));
         var original = EscapeLdapFilter(username);
-        return $"(&(objectClass=user)(objectCategory=person)(|(sAMAccountName={sam})(userPrincipalName={original})(mail={original})))";
+
+        // A plain name ("first.lastname") may be the UPN prefix rather than the sAMAccountName:
+        // pre-Windows 2000 names are limited to 20 characters, so long names are often truncated
+        // (UPN first.longlastname@company.com, sAMAccountName first.l). Match "name@*" as well.
+        var upnPrefix = !username.Contains('@') && !username.Contains('\\')
+            ? $"(userPrincipalName={original}@*)(mail={original}@*)"
+            : string.Empty;
+
+        return $"(&(objectClass=user)(objectCategory=person)(|(sAMAccountName={sam})(userPrincipalName={original})(mail={original}){upnPrefix}))";
     }
 
     /// <summary>
