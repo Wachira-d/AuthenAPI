@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.DataProtection;
 using AuthenAPI.Models;
 using AuthenAPI.Services;
 using AuthenAPI.Utilities;
@@ -35,10 +36,15 @@ public class SsoController : Controller
     private readonly IOptionsMonitor<SsoSettings> _settings;
     private readonly IAuditService _audit;
     private readonly ILogger<SsoController> _logger;
+    private readonly Microsoft.AspNetCore.DataProtection.ITimeLimitedDataProtector _freshMarker;
+
+    private const string FreshParameter = "sso_fresh";
 
     public SsoController(SsoClientService clients, SsoSessionTracker sessions, IOptionsMonitor<SsoSettings> settings,
-        IAuditService audit, ILogger<SsoController> logger)
+        IAuditService audit, ILogger<SsoController> logger, Microsoft.AspNetCore.DataProtection.IDataProtectionProvider dataProtection)
     {
+        _freshMarker = Microsoft.AspNetCore.DataProtection.DataProtectionAdvancedExtensions.ToTimeLimitedDataProtector(
+            dataProtection.CreateProtector("AuthenAPI.Sso.FreshLogin.v1"));
         _clients = clients;
         _sessions = sessions;
         _settings = settings;
@@ -63,27 +69,40 @@ public class SsoController : Controller
         var client = _clients.FindActive(request.ClientId)!; // validated by the OpenIddict handler
         var session = await HttpContext.AuthenticateAsync(SsoSetup.CookieScheme);
 
-        var mustLogin = !session.Succeeded || request.HasPrompt(Prompts.Login) || MaxAgeExceeded(request, session.Principal!);
-        if (mustLogin)
+        // prompt=login: the user must sign in again *after* this request. The marker sent along with the
+        // login round-trip is signed and time-limited, so removing or forging it only causes another login.
+        var freshSince = ReadFreshMarker(request);
+        var authTime = session.Principal is { } p0 && long.TryParse(p0.FindFirstValue(SsoSetup.ClaimAuthTime), out var at) ? at : 0;
+        var freshSatisfied = freshSince.HasValue && authTime >= freshSince.Value;
+        var needsFreshLogin = (request.HasPrompt(Prompts.Login) && !freshSatisfied) || MaxAgeExceeded(request, session.Principal);
+
+        if (!session.Succeeded || needsFreshLogin)
         {
             if (request.HasPrompt(Prompts.None))
             {
                 return ForbidOidc(Errors.LoginRequired, "The user is not signed in.");
             }
 
-            // Come back here after login. "prompt=login" is dropped so the user is not asked again in a loop.
             var parameters = request.GetParameters()
-                .Where(p => p.Key != Parameters.Prompt || !request.HasPrompt(Prompts.Login))
-                .Select(p => KeyValuePair.Create(p.Key, (StringValues)p.Value.ToString()));
+                .Where(p => p.Key != FreshParameter)
+                .Select(p => KeyValuePair.Create(p.Key, (StringValues)p.Value.ToString()))
+                .ToList();
+            if (needsFreshLogin)
+            {
+                var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
+                parameters.Add(KeyValuePair.Create(FreshParameter, (StringValues)_freshMarker.Protect(now, TimeSpan.FromMinutes(15))));
+            }
             var returnUrl = Request.PathBase + "/connect/authorize" + QueryString.Create(parameters);
-            var force = request.HasPrompt(Prompts.Login) || MaxAgeExceeded(request, session.Principal) ? "&force=1" : string.Empty;
+            var force = needsFreshLogin ? "&force=1" : string.Empty;
             return Redirect($"{Request.PathBase}/sso/login?returnUrl={Uri.EscapeDataString(returnUrl)}{force}");
         }
 
         var user = session.Principal!;
 
-        if (client.AllowedGroups.Count > 0 &&
-            !user.FindAll("groups").Any(g => client.AllowedGroups.Contains(g.Value, StringComparer.OrdinalIgnoreCase)))
+        // AllowedGroups entries may be a group name (CN) or a full DN; a DN cannot be spoofed by a
+        // same-named group created in another OU.
+        var memberOf = user.FindAll("groups").Concat(user.FindAll("group_dn")).Select(c => c.Value).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (client.AllowedGroups.Count > 0 && !client.AllowedGroups.Any(memberOf.Contains))
         {
             await AuditAsync(AuditAction.SsoAuthorize, false, user, $"{client.ClientId}: not in allowed groups");
             return ForbidOidc(Errors.AccessDenied, "Your account is not allowed to use this application.");
@@ -112,6 +131,9 @@ public class SsoController : Controller
         var granted = request.GetScopes().Intersect(SsoSetup.SupportedScopes).ToList();
         identity.SetScopes(granted);
         identity.SetDestinations(claim => Destinations(claim, granted));
+
+        // Unique per code: lets the token endpoint accept each code exactly once (also across servers).
+        identity.AddClaim(new Claim(SsoSetup.ClaimCodeId, Convert.ToHexString(RandomNumberGenerator.GetBytes(16))));
 
         _clients.RecordLogin(client.ClientId);
         await AuditAsync(AuditAction.SsoAuthorize, true, user, $"Signed in to {client.ClientId}");
@@ -142,6 +164,20 @@ public class SsoController : Controller
 
             default:
                 yield break; // not released to this client
+        }
+    }
+
+    private long? ReadFreshMarker(OpenIddictRequest request)
+    {
+        var value = request.GetParameter(FreshParameter)?.ToString();
+        if (string.IsNullOrEmpty(value)) return null;
+        try
+        {
+            return long.TryParse(_freshMarker.Unprotect(value), out var since) ? since : null;
+        }
+        catch (System.Security.Cryptography.CryptographicException)
+        {
+            return null; // forged or expired
         }
     }
 
@@ -183,12 +219,20 @@ public class SsoController : Controller
             return ForbidOidc(Errors.InvalidGrant, "The authorization code is no longer valid.");
         }
 
+        var codeId = result.Principal.FindFirstValue(SsoSetup.ClaimCodeId);
+        if (string.IsNullOrEmpty(codeId) || !_sessions.TryRedeemCode(codeId))
+        {
+            return ForbidOidc(Errors.InvalidGrant, "The authorization code has already been used.");
+        }
+
         var sid = result.Principal.FindFirstValue(SsoSetup.ClaimSessionId);
         if (sid != null && _sessions.IsRevoked(sid))
         {
             return ForbidOidc(Errors.InvalidGrant, "The user has signed out.");
         }
 
+        var identity = (ClaimsIdentity)result.Principal.Identity!;
+        foreach (var claim in identity.FindAll(SsoSetup.ClaimCodeId).ToList()) identity.RemoveClaim(claim);
         return SignIn(result.Principal, OidcScheme);
     }
 
@@ -230,9 +274,29 @@ public class SsoController : Controller
 
     [HttpGet("~/connect/logout"), HttpPost("~/connect/logout")]
     [IgnoreAntiforgeryToken]
-    public async Task<IActionResult> Logout()
+    public async Task<IActionResult> Logout([FromServices] IAntiforgery antiforgery)
     {
         var request = HttpContext.GetOpenIddictServerRequest();
+
+        // A valid id_token_hint proves the request came from an application the user signed in to.
+        // Without it, ask the user to confirm, so another website cannot sign people out.
+        var hint = string.IsNullOrEmpty(request?.IdTokenHint) ? null : (await HttpContext.AuthenticateAsync(OidcScheme)).Principal;
+        if (hint?.GetClaim(Claims.Subject) == null) hint = null;
+        if (hint == null)
+        {
+            var confirmed = HttpMethods.IsPost(Request.Method) && await antiforgery.IsRequestValidAsync(HttpContext);
+            if (!confirmed) return LogoutConfirmPage(request, antiforgery);
+        }
+        else if (!string.IsNullOrEmpty(request?.PostLogoutRedirectUri))
+        {
+            var hintClient = hint.GetAudiences().FirstOrDefault() ?? hint.GetPresenters().FirstOrDefault();
+            if (_clients.FindByPostLogoutUri(request.PostLogoutRedirectUri, hintClient) == null)
+            {
+                return Page("ออกจากระบบไม่สำเร็จ · Sign-out failed",
+                    "<h1>ออกจากระบบไม่สำเร็จ</h1><p class=\"sub\">The return address does not belong to the application that asked to sign out.</p>");
+            }
+        }
+
         var session = await HttpContext.AuthenticateAsync(SsoSetup.CookieScheme);
         await HttpContext.SignOutAsync(SsoSetup.CookieScheme);
 
@@ -242,7 +306,10 @@ public class SsoController : Controller
             var sid = user.FindFirstValue(SsoSetup.ClaimSessionId);
             if (sid != null) _sessions.Revoke(sid);
 
-            var issuer = $"{Request.Scheme}://{Request.Host}{Request.PathBase}/";
+            var configured = _settings.CurrentValue.Issuer;
+            var issuer = !string.IsNullOrWhiteSpace(configured)
+                ? configured.TrimEnd('/') + "/"
+                : $"{Request.Scheme}://{Request.Host}{Request.PathBase}/";
             foreach (var clientId in user.FindAll(SsoSetup.ClaimParticipant).Select(c => c.Value).Distinct())
             {
                 if (_clients.FindActive(clientId)?.FrontChannelLogoutUri is { Length: > 0 } uri)
@@ -283,6 +350,26 @@ public class SsoController : Controller
              {frames}
              """,
             refreshTo: next, refreshSeconds: frontChannel.Count > 0 ? 3 : 0);
+    }
+
+    private IActionResult LogoutConfirmPage(OpenIddictRequest? request, IAntiforgery antiforgery)
+    {
+        var enc = HtmlEncoder.Default;
+        var tokens = antiforgery.GetAndStoreTokens(HttpContext);
+        var fields = string.Concat((request?.GetParameters() ?? Enumerable.Empty<KeyValuePair<string, OpenIddictParameter>>())
+            .Where(p => p.Key != tokens.FormFieldName)
+            .Select(p => $"<input type=\"hidden\" name=\"{enc.Encode(p.Key)}\" value=\"{enc.Encode(p.Value.ToString() ?? string.Empty)}\">"));
+        return Page("ออกจากระบบ · Sign out",
+            $"""
+             <h1>ออกจากระบบ?</h1>
+             <p class="sub">Sign out of all applications?</p>
+             <p>คุณจะออกจากทุกแอปพลิเคชันที่ใช้ SSO</p>
+             <form method="post" action="{Request.PathBase}/connect/logout">
+               <input type="hidden" name="{enc.Encode(tokens.FormFieldName)}" value="{enc.Encode(tokens.RequestToken ?? string.Empty)}">
+               {fields}
+               <button type="submit">ออกจากระบบ · Sign out</button>
+             </form>
+             """);
     }
 
     [HttpGet("~/sso/signed-out")]
@@ -331,7 +418,9 @@ public class SsoController : Controller
         }
 
         var ip = HttpContext.GetClientIpString();
-        if (!tracker.TryBegin(username, ip, settings.MaxFailedLogins, TimeSpan.FromMinutes(Math.Max(1, settings.LockoutMinutes)), out var retry))
+        // Count failures per account: "alice", "alice@corp", "CORP\\alice" are the same person.
+        var accountKey = LdapService.ExtractSamAccountName(username).ToLowerInvariant();
+        if (!tracker.TryBegin(accountKey, ip, settings.MaxFailedLogins, TimeSpan.FromMinutes(Math.Max(1, settings.LockoutMinutes)), out var retry))
         {
             HttpContext.SetRequestOutcome("SsoLogin:LockedOut");
             await AuditLoginAsync(username, false, $"Locked out ({retry}s left)");
@@ -359,7 +448,7 @@ public class SsoController : Controller
             return LoginForm(returnUrl, force, username, message, antiforgery);
         }
 
-        tracker.Succeeded(username, ip);
+        tracker.Succeeded(accountKey, ip);
         var sid = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
         var expires = DateTimeOffset.UtcNow.AddHours(Math.Clamp(settings.SessionHours, 1, 24 * 14));
         await HttpContext.SignInAsync(SsoSetup.CookieScheme, SsoSetup.CreateSessionPrincipal(result.User, sid),

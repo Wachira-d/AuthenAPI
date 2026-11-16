@@ -1343,6 +1343,7 @@ public partial class LdapService : ILdapService
             {
                 var groupName = ExtractCnFromDn(groupDn);
                 if (!string.IsNullOrEmpty(groupName)) userInfo.Groups.Add(groupName);
+                userInfo.GroupDistinguishedNames.Add(groupDn);
             }
         }
 

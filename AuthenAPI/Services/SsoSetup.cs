@@ -10,6 +10,7 @@ using OpenIddict.Server.AspNetCore;
 using System.Collections.Concurrent;
 using System.Security.Claims;
 using System.Security.Cryptography;
+using Microsoft.EntityFrameworkCore;
 using static OpenIddict.Abstractions.OpenIddictConstants;
 using static OpenIddict.Server.OpenIddictServerEvents;
 
@@ -30,6 +31,9 @@ public static class SsoSetup
     public const string ClaimAuthTime = "auth_time";
     public const string ClaimChecked = "sso:checked";
     public const string ClaimParticipant = "sso:client";
+
+    /// <summary>Random id put into each authorization code (never into tokens) to make the code single-use</summary>
+    public const string ClaimCodeId = "sso:code_id";
 
     public static readonly string[] SupportedScopes = { Scopes.OpenId, Scopes.Profile, Scopes.Email, GroupsScope };
 
@@ -166,13 +170,6 @@ public static class SsoSetup
             return default;
         }
 
-        // Authorization codes are self-contained (degraded mode has no token store), so remember
-        // redeemed codes until they expire: a code may be exchanged only once (RFC 6749 4.1.2).
-        var tracker = context.Transaction.GetHttpRequest()!.HttpContext.RequestServices.GetRequiredService<SsoSessionTracker>();
-        if (!string.IsNullOrEmpty(context.Request.Code) && !tracker.TryRedeemCode(context.Request.Code))
-        {
-            context.Reject(Errors.InvalidGrant, "The authorization code has already been used.");
-        }
         return default;
     }
 
@@ -237,9 +234,10 @@ public static class SsoSetup
             return;
         }
 
-        var identity = new ClaimsIdentity(principal.Claims.Where(c => c.Type != ClaimChecked && c.Type != "groups"), CookieScheme);
+        var identity = new ClaimsIdentity(principal.Claims.Where(c => c.Type is not (ClaimChecked or "groups" or "group_dn")), CookieScheme);
         identity.AddClaim(new Claim(ClaimChecked, DateTime.UtcNow.Ticks.ToString()));
         foreach (var g in user.Groups) identity.AddClaim(new Claim("groups", g));
+        foreach (var dn in user.GroupDistinguishedNames) identity.AddClaim(new Claim("group_dn", dn));
         context.ReplacePrincipal(new ClaimsPrincipal(identity));
         context.ShouldRenew = true;
     }
@@ -260,6 +258,7 @@ public static class SsoSetup
         if (!string.IsNullOrWhiteSpace(user.Department)) identity.AddClaim(new Claim("department", user.Department));
         if (!string.IsNullOrWhiteSpace(user.EmployeeId)) identity.AddClaim(new Claim("employee_id", user.EmployeeId));
         foreach (var g in user.Groups) identity.AddClaim(new Claim("groups", g));
+        foreach (var dn in user.GroupDistinguishedNames) identity.AddClaim(new Claim("group_dn", dn));
         identity.AddClaim(new Claim(ClaimSessionId, sessionId));
         identity.AddClaim(new Claim(ClaimAuthTime, DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString()));
         identity.AddClaim(new Claim(ClaimChecked, DateTime.UtcNow.Ticks.ToString()));
@@ -289,26 +288,23 @@ public sealed class SsoCredentialsSetup : IConfigureOptions<OpenIddictServerOpti
 }
 
 /// <summary>
-/// Remembers SSO sessions issued by this server (for the active-session count) and sessions ended by
-/// logout, so a copied cookie stops working on this server after logout.
+/// SSO state that must hold across requests and, with a database, across servers:
+/// sessions ended by logout or account disable, and authorization codes already exchanged.
+/// Without a database it is kept in memory (single server).
 /// </summary>
 public sealed class SsoSessionTracker
 {
+    private readonly AuthenAPI.Data.Database _database;
+    private readonly ILogger<SsoSessionTracker> _logger;
     private readonly ConcurrentDictionary<string, DateTime> _active = new();
     private readonly ConcurrentDictionary<string, DateTime> _revoked = new();
-    private readonly ConcurrentDictionary<string, DateTime> _redeemedCodes = new();
+    private readonly ConcurrentDictionary<string, DateTime> _redeemed = new();
+    private long _lastCleanupTicks;
 
-    /// <summary>False when this authorization code was already exchanged (kept for longer than a code lives)</summary>
-    public bool TryRedeemCode(string code)
+    public SsoSessionTracker(AuthenAPI.Data.Database database, ILogger<SsoSessionTracker> logger)
     {
-        var key = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(code)));
-        var added = _redeemedCodes.TryAdd(key, DateTime.UtcNow.AddMinutes(15));
-        if (_redeemedCodes.Count > 1000)
-        {
-            var now = DateTime.UtcNow;
-            foreach (var (k, v) in _redeemedCodes) if (v < now) _redeemedCodes.TryRemove(k, out _);
-        }
-        return added;
+        _database = database;
+        _logger = logger;
     }
 
     public void Started(string sid, DateTime expiresUtc)
@@ -317,13 +313,76 @@ public sealed class SsoSessionTracker
         Cleanup();
     }
 
-    public void Revoke(string sid)
+    public void Revoke(string sid, DateTime? expiresUtc = null)
     {
-        _active.TryRemove(sid, out var expires);
-        _revoked[sid] = expires == default ? DateTime.UtcNow.AddDays(14) : expires;
+        var until = expiresUtc ?? (_active.TryGetValue(sid, out var e) ? e : DateTime.UtcNow.AddDays(14));
+        _active.TryRemove(sid, out _);
+        _revoked[sid] = until;
+
+        if (!_database.Enabled) return;
+        try
+        {
+            using var db = _database.CreateContext();
+            if (!db.SsoRevokedSessions.Any(r => r.SessionId == sid))
+            {
+                db.SsoRevokedSessions.Add(new AuthenAPI.Data.SsoRevokedSession { SessionId = sid, ExpiresAt = until });
+                db.SaveChanges();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Could not record ended SSO session in the database: {Error}", ex.GetBaseException().Message);
+        }
     }
 
-    public bool IsRevoked(string sid) => _revoked.ContainsKey(sid);
+    public bool IsRevoked(string sid)
+    {
+        if (_revoked.ContainsKey(sid)) return true;
+        if (!_database.Enabled) return false;
+        try
+        {
+            using var db = _database.CreateContext();
+            if (db.SsoRevokedSessions.Any(r => r.SessionId == sid))
+            {
+                _revoked[sid] = DateTime.UtcNow.AddDays(1);
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Could not check ended SSO sessions in the database: {Error}", ex.GetBaseException().Message);
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Mark an authorization code (by the unique id embedded in it at issue time) as used.
+    /// False when it was already used, here or on another server. Fails closed if the shared store is unreachable.
+    /// </summary>
+    public bool TryRedeemCode(string codeId)
+    {
+        var expires = DateTime.UtcNow.AddMinutes(10);
+        if (!_redeemed.TryAdd(codeId, expires)) return false;
+        Cleanup();
+
+        if (!_database.Enabled) return true;
+        try
+        {
+            using var db = _database.CreateContext();
+            db.SsoRedeemedCodes.Add(new AuthenAPI.Data.SsoRedeemedCode { CodeId = codeId, ExpiresAt = expires });
+            db.SaveChanges();
+            return true;
+        }
+        catch (Microsoft.EntityFrameworkCore.DbUpdateException)
+        {
+            return false; // primary key violation: redeemed on another server
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Could not record redeemed code in the database: {Error}", ex.GetBaseException().Message);
+            return false;
+        }
+    }
 
     public int ActiveCount
     {
@@ -337,7 +396,23 @@ public sealed class SsoSessionTracker
     private void Cleanup()
     {
         var now = DateTime.UtcNow;
+        var last = Interlocked.Read(ref _lastCleanupTicks);
+        if (now.Ticks - last < TimeSpan.TicksPerMinute || Interlocked.CompareExchange(ref _lastCleanupTicks, now.Ticks, last) != last) return;
+
         foreach (var (k, v) in _active) if (v < now) _active.TryRemove(k, out _);
         foreach (var (k, v) in _revoked) if (v < now) _revoked.TryRemove(k, out _);
+        foreach (var (k, v) in _redeemed) if (v < now) _redeemed.TryRemove(k, out _);
+
+        if (!_database.Enabled) return;
+        try
+        {
+            using var db = _database.CreateContext();
+            db.SsoRedeemedCodes.Where(c => c.ExpiresAt < now).ExecuteDelete();
+            db.SsoRevokedSessions.Where(c => c.ExpiresAt < now).ExecuteDelete();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("SSO state cleanup failed: {Error}", ex.GetBaseException().Message);
+        }
     }
 }

@@ -20,11 +20,18 @@ public class SsoSettings
     public int AccessTokenMinutes { get; set; } = 30;
 
     /// <summary>Failed logins per username before a temporary lockout (AD has its own lockout too)</summary>
-    public int MaxFailedLogins { get; set; } = 5;
+    public int MaxFailedLogins { get; set; } = 3;
     public int LockoutMinutes { get; set; } = 15;
 
     /// <summary>Failed logins per client IP. Higher than for the admin portal: an office NATs many users behind one IP.</summary>
     public int MaxFailedLoginsPerIp { get; set; } = 100;
+
+    /// <summary>
+    /// Optional IP/CIDR allow-list for the SSO login and OIDC endpoints. Empty = reachable from anywhere.
+    /// When used, include the users' networks (office/VPN) AND the servers of the applications
+    /// (they call /connect/token). Loopback is always allowed.
+    /// </summary>
+    public List<string> AllowedIpAddresses { get; set; } = new();
 }
 
 /// <summary>

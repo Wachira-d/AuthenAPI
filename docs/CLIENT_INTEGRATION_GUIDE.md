@@ -303,76 +303,129 @@ DELETE FROM dbo.AuthOfflineCache WHERE LastOnlineVerifiedUtc < DATEADD(hour, -24
 
 ## 12. Single Sign-On (SSO): login ครั้งเดียว เข้าได้ทุกระบบ
 
-> **สถานะ: แนวทางที่วางไว้ ยังไม่ได้เปิดใช้งาน** ส่วนนี้ต้องสร้างเพิ่มใน AuthenAPI ก่อน หัวข้อ 1–11 ใช้งานได้แล้ววันนี้ และยังใช้เป็นทางสำรองต่อไปได้หลังมี SSO
+> **สถานะ: ใช้งานได้แล้ว** แนะนำให้ระบบใหม่ทุกระบบใช้วิธีนี้แทนการส่งรหัสผ่านมาเอง (หัวข้อ 3–8)
+> ระบบเดิมที่ใช้วิธีส่งรหัสผ่านอยู่แล้ว ยังใช้ต่อได้ตามปกติ และใช้เป็นทางสำรองได้
 
-### เป้าหมาย
-
-ผู้ใช้ login ที่ระบบใดระบบหนึ่งแล้ว เมื่อเปิดระบบอื่นจะเข้าได้ทันทีโดยไม่ต้องพิมพ์รหัสซ้ำ และเมื่อ logout ก็ออกจากทุกระบบพร้อมกัน
-
-### แนวทางที่แนะนำ: OpenID Connect (OIDC)
-
-AuthenAPI ทำหน้าที่เป็น **Identity Provider** กลาง โดยใช้ OpenID Connect ซึ่งเป็นมาตรฐานเดียวกับ "Sign in with Microsoft/Google"
-ทุกภาษามี library รองรับ (.NET มีมาให้ในตัว คือ `AddOpenIdConnect`) ทีมปลายทางจึงไม่ต้องเขียน logic เอง
+AuthenAPI ทำหน้าที่เป็น **Identity Provider กลางแบบ OpenID Connect (OIDC)** ซึ่งเป็นมาตรฐานเดียวกับ "Sign in with Microsoft" ทุกภาษามี library รองรับ
 
 ```
 ผู้ใช้เปิด Coupon (ยังไม่ login)
    │  redirect
    ▼
-authen.hondacx.me/connect/authorize ──► มี SSO session อยู่แล้ว? ── ใช่ ──► ส่งกลับทันที (ไม่ถามรหัส)
-   │ ไม่มี                                                                       │
-   ▼                                                                             │
-หน้า login กลาง (username + password → AD)                                       │
-   │ สำเร็จ: สร้าง SSO session (cookie ของ authen.hondacx.me)                    │
-   ▼                                                                             ▼
-redirect กลับ Coupon พร้อม authorization code ──► Coupon (ฝั่ง server) แลก code เป็น id_token
-                                                  (ชื่อ, UPN, email, groups) → สร้าง session ของตัวเอง
+authen.hondacx.me/connect/authorize ── มี SSO session แล้ว? ── ใช่ ──► กลับไปที่ Coupon ทันที (ไม่ถามรหัส)
+   │ ไม่มี
+   ▼
+หน้า login กลาง (authen.hondacx.me/sso/login) → ตรวจกับ AD → สร้าง SSO session 8 ชั่วโมง
+   ▼
+redirect กลับ Coupon พร้อม authorization code → Coupon (ฝั่ง server) แลก code เป็น id_token (ชื่อ UPN email groups)
 
-ต่อมาผู้ใช้เปิด Cash Advance → redirect ไป authorize → มี SSO session แล้ว → กลับมาทันที (ไม่ต้องพิมพ์รหัส)
+ต่อมาเปิด Cash Advance → redirect ไป authorize → มี session อยู่แล้ว → เข้าได้ทันที
+logout จากระบบใดระบบหนึ่ง → ออกจากทุกระบบ (front-channel logout)
 ```
 
-### ข้อดีเมื่อเทียบกับให้แต่ละระบบส่งรหัสมาเอง (หัวข้อ 3)
+### 12.1 ข้อดีเมื่อเทียบกับส่งรหัสผ่านมาเอง
 
-| เรื่อง | ส่งรหัสผ่าน API (ปัจจุบัน) | SSO (OIDC) |
+| เรื่อง | ส่งรหัสผ่านผ่าน API | SSO (OIDC) |
 |---|---|---|
-| ระบบปลายทางได้เห็นรหัสผ่าน | เห็น | **ไม่เห็นเลย** รหัสถูกพิมพ์ที่หน้า login กลางเท่านั้น |
-| พิมพ์รหัสซ้ำทุกระบบ | ต้องพิมพ์ | พิมพ์ครั้งเดียวต่อวัน |
-| Logout | ทีละระบบ | ออกพร้อมกันทุกระบบได้ |
-| เพิ่ม MFA / Windows login อัตโนมัติในอนาคต | ต้องแก้ทุกระบบ | แก้ที่หน้า login กลางที่เดียว |
-| Offline cache รหัสผ่าน | แต่ละระบบต้องทำเอง | ไม่ต้องทำ |
-| ถ้า AuthenAPI ล่ม | ใช้ fallback ตามหัวข้อ 6–7 ได้ | login ใหม่ไม่ได้ (คนที่มี session อยู่แล้วยังใช้งานต่อได้) ระบบสำคัญจึงควรเก็บฟอร์ม login เดิมไว้เป็นทางสำรอง |
+| ระบบของคุณเห็นรหัสผ่านพนักงาน | เห็น | **ไม่เห็น** |
+| พิมพ์รหัสซ้ำทุกระบบ | ต้องพิมพ์ | ครั้งเดียวต่อ 8 ชั่วโมง |
+| Logout | ทีละระบบ | ออกทุกระบบพร้อมกัน |
+| Offline cache, fallback, circuit breaker | ต้องทำเอง | ไม่ต้องทำ |
+| คนลาออก หรือบัญชีถูก disable | ต้องรอ cache หมดอายุ | SSO session หมดภายใน 10 นาที |
+| ถ้า AuthenAPI ล่ม | ใช้ fallback ได้ | login ใหม่ไม่ได้ (คนที่มี session ในระบบคุณอยู่แล้วยังใช้งานต่อได้) |
 
-### สิ่งที่จะสร้างใน AuthenAPI
+### 12.2 ขั้นตอนขอใช้งาน
 
-1. Endpoint มาตรฐาน OIDC: `/.well-known/openid-configuration`, `/connect/authorize`, `/connect/token`, `/connect/userinfo`, `/connect/logout`
-2. หน้า login กลาง (ไทย/อังกฤษ) ใช้ logic ตรวจ AD ตัวเดียวกับที่ใช้อยู่ตอนนี้ (รองรับทุกรูปแบบชื่อ และนับรหัสผิดใน AD แค่ 1 ครั้งต่อการพิมพ์ผิด 1 ครั้ง)
-3. SSO session อายุ 8 ชั่วโมง (ตั้งค่าได้) และหมดอายุทันทีเมื่อบัญชีถูก disable (ตรวจซ้ำเป็นรอบ)
-4. หน้า Admin → **Applications**: ลงทะเบียนระบบปลายทาง (client_id, secret, redirect URI ที่อนุญาต, group ที่เข้าระบบนั้นได้)
-5. Audit log และ Request log ของการ login ผ่าน SSO ทุกครั้ง
-6. (ทางเลือก) **Windows Integrated Login**: เครื่องที่ join โดเมนแล้วเข้าได้เลยโดยไม่ต้องพิมพ์รหัส (Kerberos)
+แจ้งผู้ดูแล AuthenAPI พร้อมข้อมูล:
+1. **ชื่อระบบ** ที่จะแสดงบนหน้า login เช่น "Coupon"
+2. **Redirect URI** เช่น `https://coupon.hondacx.me/signin-oidc` ต้องเป็น https และต้องตรงทุกตัวอักษร ใส่ได้หลายตัว เช่นของ UAT และ production
+3. **Post-logout redirect URI** เช่น `https://coupon.hondacx.me/signout-callback-oidc`
+4. **Front-channel logout URI** (ถ้าต้องการ logout พร้อมทุกระบบ) เช่น `https://coupon.hondacx.me/signout-oidc`
+5. **AD group ที่เข้าระบบนี้ได้** (ถ้าไม่ระบุ พนักงานทุกคนเข้าได้)
+6. ประเภทระบบ:
+   - **confidential**: มี server ของตัวเอง ได้รับ `client_secret` ระบบส่วนใหญ่เป็นแบบนี้
+   - **public**: เป็น SPA หรือแอปมือถือที่ไม่มี server ใช้ PKCE อย่างเดียว ไม่มี secret
 
-### สิ่งที่ระบบปลายทางต้องทำ (ตัวอย่าง ASP.NET Core)
+ผู้ดูแลจะลงทะเบียนในหน้า Admin → **แอปพลิเคชัน (SSO)** แล้วส่ง `ClientId` และ `ClientSecret` ให้ secret จะแสดง**ครั้งเดียว** ให้เก็บใน secret store ทันที
+
+### 12.3 ค่าที่ใช้เชื่อมต่อ
+
+| รายการ | ค่า |
+|---|---|
+| Authority / Issuer | `https://authen.hondacx.me/` |
+| Discovery | `https://authen.hondacx.me/.well-known/openid-configuration` |
+| Flow | Authorization Code + PKCE (S256) **เท่านั้น** ไม่รองรับ implicit, password และ refresh token |
+| Scope | `openid profile email groups` |
+| Client authentication | `client_secret_post` หรือ `client_secret_basic` |
+
+**Claims ที่ได้รับ:**
+
+| Claim | Scope | ตัวอย่าง |
+|---|---|---|
+| `sub` | openid | `phuriphat.phiphatthanawaranon@ipsos.com` (UPN ตัวเล็ก ใช้เป็น userKey ได้เลย) |
+| `name`, `given_name`, `family_name` | profile | `Phuriphat Phiphatthanawaranon` |
+| `preferred_username`, `upn` | profile | `Phuriphat.Phiphatthanawaranon@ipsos.com` |
+| `department`, `employee_id` | profile | `IT`, `12345` |
+| `email` | email | `phuriphat.phiphatthanawaranon@ipsos.com` |
+| `groups` | groups | `["TH-IT", "VPN Users"]` (direct member) |
+| `sid`, `auth_time` | openid | session id และเวลาที่ login |
+
+อายุของ token: id_token 10 นาที, access token 30 นาที, authorization code 5 นาทีและใช้ได้ครั้งเดียว ระบบของคุณควรสร้าง session cookie ของตัวเองหลัง login แล้วไม่ต้องใช้ token ต่อ
+
+### 12.4 ตัวอย่าง ASP.NET Core (.NET 6+)
 
 ```csharp
+// NuGet: Microsoft.AspNetCore.Authentication.OpenIdConnect
 builder.Services.AddAuthentication(o =>
     {
         o.DefaultScheme = CookieAuthenticationDefaults.AuthenticationScheme;
         o.DefaultChallengeScheme = OpenIdConnectDefaults.AuthenticationScheme;
     })
-    .AddCookie()
+    .AddCookie(o =>
+    {
+        o.ExpireTimeSpan = TimeSpan.FromHours(8);
+        // จำเป็นสำหรับ front-channel logout (cookie ต้องถูกส่งใน iframe จาก authen.hondacx.me)
+        o.Cookie.SameSite = SameSiteMode.None;
+        o.Cookie.SecurePolicy = CookieSecurePolicy.Always;
+    })
     .AddOpenIdConnect(o =>
     {
-        o.Authority = "https://authen.hondacx.me";
-        o.ClientId = "coupon";
-        o.ClientSecret = builder.Configuration["Sso:ClientSecret"];
-        o.ResponseType = "code";            // Authorization Code + PKCE
+        o.Authority = builder.Configuration["Sso:Authority"];       // https://authen.hondacx.me/
+        o.ClientId = builder.Configuration["Sso:ClientId"];
+        o.ClientSecret = builder.Configuration["Sso:ClientSecret"];  // จาก secret store
+        o.ResponseType = "code";
+        o.UsePkce = true;
+        o.MapInboundClaims = false;                                  // ให้ชื่อ claim ตรงกับตารางด้านบน
+        o.GetClaimsFromUserInfoEndpoint = true;
         o.Scope.Add("profile"); o.Scope.Add("email"); o.Scope.Add("groups");
-        o.SaveTokens = true;
+        o.TokenValidationParameters.NameClaimType = "name";
+        o.TokenValidationParameters.RoleClaimType = "groups";        // ใช้ [Authorize(Roles = "TH-IT")] ได้
+        o.SaveTokens = true;                                          // ต้องใช้ id_token ตอน logout
     });
+
+app.UseAuthentication();
+app.UseAuthorization();
+
+// Logout จากทุกระบบ
+app.MapGet("/logout", async (HttpContext c) =>
+{
+    await c.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+    await c.SignOutAsync(OpenIdConnectDefaults.AuthenticationScheme,
+        new AuthenticationProperties { RedirectUri = "/" });
+});
 ```
-ระบบที่ไม่ใช่ .NET ให้ใช้ library OIDC ของภาษานั้น เช่น Java Spring Security OAuth2 Client, PHP `jumbojett/openid-connect-php`, Node `openid-client`
+Path ที่ library ใช้เป็นค่าเริ่มต้น และตรงกับที่ต้องลงทะเบียน: `/signin-oidc`, `/signout-callback-oidc` และ `/signout-oidc` (front-channel)
 
+ภาษาอื่น: Java ใช้ Spring Security OAuth2 Client, PHP ใช้ `jumbojett/openid-connect-php`, Node ใช้ `openid-client` ให้ตั้งค่าตาม 12.3
 
----
+### 12.5 ข้อควรระวัง
+
+- **อยู่หลัง reverse proxy หรือ load balancer** ต้องให้ระบบรู้ว่าเป็น https มิฉะนั้น redirect URI จะกลายเป็น `http://` แล้วไม่ตรงกับที่ลงทะเบียนไว้ (ASP.NET Core: `UseForwardedHeaders`)
+- **Front-channel logout** ทำงานผ่าน iframe ที่โหลดข้ามโดเมน cookie ของระบบคุณจึงต้องเป็น `SameSite=None; Secure` ถ้า browser บล็อก third-party cookie ระบบคุณจะไม่ถูก logout อัตโนมัติ แต่ SSO session ถูกปิดแล้ว ผู้ใช้จึงต้อง login ใหม่ทันทีที่ session ของระบบคุณหมดอายุ
+- **Logout ต้องส่ง `id_token_hint`** (ใน ASP.NET Core คือ `SaveTokens = true` ตามตัวอย่าง) ถ้าไม่ส่ง หรือ token ไม่ใช่ของระบบคุณ ผู้ใช้จะเห็นหน้ายืนยัน "ออกจากระบบ?" ก่อน และจะไม่ถูก redirect กลับไปที่ `post_logout_redirect_uri` ของคุณ (กันเว็บอื่นสั่ง logout ผู้ใช้แบบไม่รู้ตัว)
+- **ตัดสินสิทธิ์จาก `groups`** ระบบรับประกันว่าผู้ใช้อยู่ใน AD group ที่ลงทะเบียนไว้เฉพาะตอน login ถ้าต้องการสถานะที่สดกว่านั้น ให้ session ของระบบคุณสั้นลง
+- **ห้าม** log หรือส่ง `client_secret`, `code`, `id_token`, `access_token` ไปยัง browser
+- **Error ที่อาจได้รับกลับมา:** `access_denied` (ผู้ใช้ไม่อยู่ใน group ที่อนุญาต), `login_required` (กรณีส่ง `prompt=none` แต่ผู้ใช้ยังไม่ได้ login) ให้แสดงข้อความที่เหมาะสม อย่าวนส่งไป login ใหม่ไม่หยุด
 
 ## 13. คำถามที่พบบ่อย
 

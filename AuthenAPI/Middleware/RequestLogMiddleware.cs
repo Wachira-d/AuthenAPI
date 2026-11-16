@@ -52,7 +52,7 @@ public class RequestLogMiddleware
                 Timestamp = DateTime.UtcNow,
                 Method = context.Request.Method,
                 Path = Truncate(path.Value) ?? string.Empty,
-                QueryString = Truncate(context.Request.QueryString.HasValue ? context.Request.QueryString.Value : null),
+                QueryString = Truncate(RedactQuery(context.Request.Query)),
                 StatusCode = status,
                 DurationMs = stopwatch.ElapsedMilliseconds,
                 ClientIp = context.GetClientIpString(),
@@ -66,6 +66,20 @@ public class RequestLogMiddleware
                 LdapStrategy = context.Items[RequestLogItems.LdapStrategy] as string
             });
         }
+    }
+
+    private static readonly HashSet<string> SecretParameters = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "access_token", "id_token", "id_token_hint", "refresh_token", "code", "code_verifier",
+        "client_secret", "password", "sso_fresh", "state", "nonce"
+    };
+
+    /// <summary>Query string with token-like values replaced, so log readers never see credentials</summary>
+    private static string? RedactQuery(IQueryCollection query)
+    {
+        if (query.Count == 0) return null;
+        return "?" + string.Join("&", query.Select(q =>
+            $"{Uri.EscapeDataString(q.Key)}={(SecretParameters.Contains(q.Key) ? "[redacted]" : Uri.EscapeDataString(q.Value.ToString()))}"));
     }
 
     private static string DefaultOutcome(int status) => status switch

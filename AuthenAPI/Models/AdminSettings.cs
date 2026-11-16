@@ -44,7 +44,7 @@ public class AdminSettings
     /// <summary>
     /// Failed admin logins (per username + IP) before a temporary lockout
     /// </summary>
-    public int MaxFailedLogins { get; set; } = 5;
+    public int MaxFailedLogins { get; set; } = 3;
 
     /// <summary>
     /// Lockout duration in minutes after too many failed admin logins

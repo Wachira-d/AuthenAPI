@@ -96,6 +96,12 @@ public class UserInfo
     public List<string> Groups { get; set; } = new();
 
     /// <summary>
+    /// Full distinguished names of the groups (direct membership). Unlike the short names in
+    /// <see cref="Groups"/>, these are unique across the directory.
+    /// </summary>
+    public List<string> GroupDistinguishedNames { get; set; } = new();
+
+    /// <summary>
     /// When the account was created
     /// </summary>
     public DateTime? WhenCreated { get; set; }

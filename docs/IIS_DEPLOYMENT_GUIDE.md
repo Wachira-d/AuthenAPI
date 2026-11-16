@@ -157,7 +157,7 @@ icacls "D:\Web Sites\wwwroot\AuthenAPI\logs" /grant "IIS AppPool\AuthenAPIPool:(
 ```
 
 - `AdminUsers` / `ViewerUsers` ใส่ sAMAccountName หรือ UPN (ไม่รองรับ email เพราะ attribute mail แก้ไขได้ง่ายกว่า)
-- `AdminGroups` / `ViewerGroups` คือชื่อ group ใน AD (นับเฉพาะ direct member ไม่รวม nested group)
+- `AdminGroups` / `ViewerGroups` คือชื่อ group ใน AD (นับเฉพาะ direct member ไม่รวม nested group) ใส่ได้ทั้งชื่อ CN เช่น `AuthenAPI-Admins` หรือ DN เต็ม เช่น `CN=AuthenAPI-Admins,OU=Groups,DC=ipsosgroup,DC=ipsos,DC=com` **แนะนำ DN เต็ม** เพราะชื่อ CN ซ้ำกันได้ใน OU ต่างกัน
 - `AllowedIpAddresses` จำกัด IP ที่เปิดหน้า admin ได้ (ว่าง = ใช้ whitelist หลัก) — จาก server เอง (127.0.0.1) เข้าได้เสมอ
 
 ### 3. บัญชีฉุกเฉิน (break-glass) สำหรับตอน AD ล่ม — แนะนำให้มี 1 บัญชี
@@ -234,6 +234,82 @@ ALTER ROLE db_ddladmin  ADD MEMBER authenapi_app;   -- ให้ระบบส�
 
 Key และ settings ที่แก้บนเครื่องหนึ่ง จะมีผลกับเครื่องอื่นภายใน 30 วินาที
 **ต้อง copy โฟลเดอร์ `App_Data\\keys` ให้เหมือนกันทุกเครื่อง** ไม่อย่างนั้น admin session จะใช้ข้ามเครื่องไม่ได้ และรหัสผ่าน service account ที่บันทึกผ่านหน้าเว็บจะถอดรหัสบนเครื่องอื่นไม่ได้
+
+---
+
+## Single Sign-On (SSO)
+
+หลัง deploy เวอร์ชันนี้ ระบบเปิด endpoint ต่อไปนี้ให้ใช้ได้ทันที:
+- `https://authen.hondacx.me/.well-known/openid-configuration`
+- `/connect/*`
+- หน้า login กลาง `/sso/login`
+
+### 1. ตั้งค่าใน `appsettings.json` บน server
+
+```json
+"SsoSettings": {
+  "Enabled": true,
+  "Issuer": "https://authen.hondacx.me/",
+  "SessionHours": 8,
+  "AccountRecheckMinutes": 10,
+  "IdentityTokenMinutes": 10,
+  "AccessTokenMinutes": 30,
+  "MaxFailedLogins": 3,
+  "LockoutMinutes": 15,
+  "MaxFailedLoginsPerIp": 100,
+  "AllowedIpAddresses": []
+}
+```
+
+และตั้ง `AllowedHosts` ให้รับเฉพาะชื่อเว็บจริง (กันการปลอม Host header ไปเปลี่ยน URL ในหน้า discovery):
+
+```json
+"AllowedHosts": "authen.hondacx.me;localhost"
+```
+พร้อมผูก binding ของเว็บใน IIS ด้วย Host name `authen.hondacx.me`
+
+- **`Issuer` ต้องตั้งเป็น URL https จริงของเว็บนี้ และต้องมี `/` ปิดท้าย** ระบบปลายทางจะตรวจค่านี้กับค่าใน token ถ้าไม่ตรง login จะล้มเหลว
+- **ต้องเป็น HTTPS** cookie ของ SSO ตั้งเป็น Secure เสมอ ถ้าเปิดผ่าน http จะ login ไม่ได้
+- **`AllowedIpAddresses`:** เว็บนี้เข้าถึงได้จากอินเทอร์เน็ต ถ้าพนักงานใช้งานผ่านเครือข่ายบริษัทหรือ VPN เท่านั้น แนะนำให้ใส่ช่วง IP ของบริษัท/VPN **รวมกับ IP ของ server ระบบปลายทางทุกตัว** เพราะ server เหล่านั้นต้องเรียก `/connect/token` ถ้าปล่อยว่าง ใครบนอินเทอร์เน็ตก็เปิดหน้า login ได้ (มี lockout ป้องกันการเดารหัสอยู่แล้ว)
+- **`MaxFailedLogins` = 3** (นับต่อชื่อบัญชี) ต้องน้อยกว่า lockout threshold ของ AD เพื่อให้ระบบนี้ล็อกก่อนที่ AD จะล็อกบัญชีจริงของพนักงาน
+- **`MaxFailedLoginsPerIp`** ตั้งไว้สูงกว่าหน้า Admin เพราะพนักงานทั้งออฟฟิศมักออกอินเทอร์เน็ตผ่าน IP เดียวกัน (NAT)
+
+### 2. Key ที่ใช้เซ็น token
+
+ครั้งแรกที่เริ่มทำงาน ระบบจะสร้าง key สำหรับเซ็นและเข้ารหัส token ให้อัตโนมัติ:
+- ไม่มี database: เก็บที่ `App_Data\sso-keys.json`
+- มี database: เก็บในตาราง `dbo.SsoKeys`
+
+key ถูกเข้ารหัสด้วย Data Protection อีกชั้น (คือ `App_Data\keys`) จึงต้อง **backup `App_Data` ทั้งโฟลเดอร์** ถ้า key หาย token เดิมจะใช้ไม่ได้ และทุกคนต้อง login ใหม่ ไม่มีข้อมูลเสียหาย
+
+#### กรณีมี server มากกว่า 1 เครื่อง (load balancer)
+
+**การ copy `App_Data\keys` ไปเครื่องอื่นใช้ไม่ได้** เพราะบน Windows key ถูกเข้ารหัสด้วย DPAPI ที่ผูกกับเครื่อง ให้ทำแบบนี้แทน:
+
+1. ใช้ SQL Server (ตั้ง `ConnectionStrings:AuthenAPI`) ทุกเครื่องชี้ database เดียวกัน
+2. ติดตั้ง certificate ตัวเดียวกัน **พร้อม private key** ลงใน `Local Computer\Personal` ของทุกเครื่อง (ใช้ certificate ของเว็บเองได้) แล้วให้สิทธิ์ app pool อ่าน private key: `certlm.msc` → คลิกขวาที่ cert → All Tasks → Manage Private Keys → เพิ่ม `IIS AppPool\AuthenAPIPool` สิทธิ์ Read
+3. ตั้งค่าในทุกเครื่อง:
+   ```json
+   "DataProtection": {
+     "StoreKeysInDatabase": true,
+     "CertificateThumbprint": "<thumbprint ของ cert>"
+   }
+   ```
+4. Restart app pool ทุกเครื่อง แล้ว login ใหม่หนึ่งครั้ง (cookie เดิมจะใช้ไม่ได้ และรหัส service account ที่บันทึกผ่านหน้าเว็บต้องกรอกใหม่)
+
+เมื่อ cert หมดอายุและเปลี่ยนใบใหม่ ให้ **เก็บใบเก่าไว้ใน store ต่อ** อย่างน้อยจนกว่า session ทั้งหมดหมดอายุ ไม่งั้น key เดิมจะถอดรหัสไม่ได้
+
+### 3. ลงทะเบียนระบบปลายทาง
+
+หน้า Admin → **แอปพลิเคชัน (SSO)** → สร้าง application แล้วส่ง Client ID และ Secret ให้ทีมนั้น พร้อมคู่มือ `docs/CLIENT_INTEGRATION_GUIDE.md` หัวข้อ 12
+
+### 4. ตรวจหลัง deploy
+
+```powershell
+# ต้องได้ JSON ที่มี "issuer": "https://authen.hondacx.me/"
+Invoke-RestMethod https://authen.hondacx.me/.well-known/openid-configuration
+```
+จากนั้นเปิด `https://authen.hondacx.me/sso/login` ด้วย Edge หรือ Chrome แล้วลอง login ถ้าสำเร็จจะขึ้นหน้า "เข้าสู่ระบบแล้ว"
 
 ---
 

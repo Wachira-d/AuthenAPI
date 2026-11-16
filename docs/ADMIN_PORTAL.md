@@ -226,7 +226,7 @@ See section "Admin Portal" in `docs/IIS_DEPLOYMENT_GUIDE.md` (data folder permis
   "redirectUris": ["https://coupon.hondacx.me/signin-oidc"],              // exact match, https (http only for localhost)
   "postLogoutRedirectUris": ["https://coupon.hondacx.me/signout-callback-oidc"],
   "frontChannelLogoutUri": "https://coupon.hondacx.me/signout-oidc",     // optional: called in a hidden iframe on single logout
-  "allowedGroups": [],                       // empty = every AD user; otherwise user must be a direct member of one
+  "allowedGroups": [],                       // empty = every AD user; otherwise user must be a direct member of one (CN or full DN; DN recommended)
   "requirePkce": true, "isActive": true }
 // SsoClientView = SsoClientInput fields + 
 { "createdAt": "…", "createdBy": "…", "updatedAt": "…", "secretRotatedAt": "…", "lastLoginAt": "…", "loginCount": 0 }

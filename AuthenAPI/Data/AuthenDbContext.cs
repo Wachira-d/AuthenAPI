@@ -32,7 +32,19 @@ public class SsoKeyRow
     public DateTime CreatedAt { get; set; }
 }
 
-public class AuthenDbContext : DbContext
+public class SsoRedeemedCode
+{
+    public string CodeId { get; set; } = string.Empty;
+    public DateTime ExpiresAt { get; set; }
+}
+
+public class SsoRevokedSession
+{
+    public string SessionId { get; set; } = string.Empty;
+    public DateTime ExpiresAt { get; set; }
+}
+
+public class AuthenDbContext : DbContext, Microsoft.AspNetCore.DataProtection.EntityFrameworkCore.IDataProtectionKeyContext
 {
     public AuthenDbContext(DbContextOptions<AuthenDbContext> options) : base(options) { }
 
@@ -43,6 +55,10 @@ public class AuthenDbContext : DbContext
     public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
     public DbSet<SsoClient> SsoClients => Set<SsoClient>();
     public DbSet<SsoKeyRow> SsoKeys => Set<SsoKeyRow>();
+    public DbSet<SsoRedeemedCode> SsoRedeemedCodes => Set<SsoRedeemedCode>();
+    public DbSet<SsoRevokedSession> SsoRevokedSessions => Set<SsoRevokedSession>();
+    public DbSet<Microsoft.AspNetCore.DataProtection.EntityFrameworkCore.DataProtectionKey> DataProtectionKeys
+        => Set<Microsoft.AspNetCore.DataProtection.EntityFrameworkCore.DataProtectionKey>();
 
     protected override void OnModelCreating(ModelBuilder b)
     {
@@ -77,6 +93,10 @@ public class AuthenDbContext : DbContext
             e.HasKey(x => x.Id);
             e.Property(x => x.Id).ValueGeneratedNever();
         });
+
+        b.Entity<SsoRedeemedCode>(e => { e.ToTable("SsoRedeemedCodes"); e.HasKey(x => x.CodeId); });
+        b.Entity<SsoRevokedSession>(e => { e.ToTable("SsoRevokedSessions"); e.HasKey(x => x.SessionId); });
+        b.Entity<Microsoft.AspNetCore.DataProtection.EntityFrameworkCore.DataProtectionKey>(e => e.ToTable("DataProtectionKeys"));
 
         b.Entity<RuntimeSettingsRow>(e =>
         {

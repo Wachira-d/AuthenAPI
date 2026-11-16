@@ -483,7 +483,7 @@ public sealed class SsoKeyStore
             File.WriteAllText(file, protector.Protect(JsonSerializer.Serialize(generated)));
             logger.LogInformation("Created SSO signing/encryption keys in {Path}", file);
             return generated;
-        });
+        }, LazyThreadSafetyMode.PublicationOnly); // a failure (database down on first start) is retried, not cached
     }
 
     public SsoKeyMaterial Keys => _keys.Value;

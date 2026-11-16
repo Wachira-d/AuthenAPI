@@ -161,7 +161,9 @@ public sealed class AdminAuthService
         username = username.Trim();
         var lockout = TimeSpan.FromMinutes(Math.Max(1, settings.LockoutMinutes));
 
-        if (!_tracker.TryBegin(username, clientIp, settings.MaxFailedLogins, lockout, out var retryAfter))
+        // Count failures per account, whatever spelling was typed (alice / alice@corp / CORP\\alice).
+        var accountKey = LdapService.ExtractSamAccountName(username).ToLowerInvariant();
+        if (!_tracker.TryBegin(accountKey, clientIp, settings.MaxFailedLogins, lockout, out var retryAfter))
         {
             return new AdminLoginResult { Status = AdminLoginStatus.LockedOut, RetryAfterSeconds = retryAfter };
         }
@@ -176,7 +178,7 @@ public sealed class AdminAuthService
             var result = await LoginCoreAsync(username, password, settings);
             if (result.Status == AdminLoginStatus.Success)
             {
-                _tracker.Succeeded(username, clientIp);
+                _tracker.Succeeded(accountKey, clientIp);
             }
             return result;
         }
@@ -218,7 +220,7 @@ public sealed class AdminAuthService
         // Only directory-assigned names count as identity. The typed input and the mail attribute do not:
         // mail can often be edited by the user or helpdesk, and would otherwise grant admin rights.
         var identities = DirectoryIdentities(user);
-        var (role, source) = ResolveRole(settings, identities, user.Groups);
+        var (role, source) = ResolveRole(settings, identities, user.Groups.Concat(user.GroupDistinguishedNames));
         if (role == null)
         {
             _logger.LogWarning("Admin login denied: {Username} authenticated against AD but is not an admin or viewer", username);
@@ -284,6 +286,7 @@ public sealed class AdminAuthService
         // Only the groups that matter for portal roles go into the cookie.
         var relevant = settings.AdminGroups.Concat(settings.ViewerGroups).Select(g => g.Trim()).ToHashSet(StringComparer.OrdinalIgnoreCase);
         claims.AddRange(groups.Where(relevant.Contains).Distinct(StringComparer.OrdinalIgnoreCase).Select(g => new Claim(ClaimGroups, g)));
+        // (AdminGroups/ViewerGroups entries may be short names or full DNs; both forms are matched.)
 
         var principal = new ClaimsPrincipal(new ClaimsIdentity(claims, AdminRoles.Scheme));
         return new AdminLoginResult
@@ -344,7 +347,7 @@ public sealed class AdminAuthService
         {
             var user = await services.GetRequiredService<ILdapService>().GetUserFreshAsync(name);
             stillValid = user is { IsEnabled: true } &&
-                         ResolveRole(settings, DirectoryIdentities(user), user.Groups).Role == role;
+                         ResolveRole(settings, DirectoryIdentities(user), user.Groups.Concat(user.GroupDistinguishedNames)).Role == role;
 
             if (stillValid)
             {

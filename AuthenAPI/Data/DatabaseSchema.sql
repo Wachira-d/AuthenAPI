@@ -129,3 +129,26 @@ IF OBJECT_ID(N'dbo.SsoKeys', N'U') IS NULL
 
 IF NOT EXISTS (SELECT 1 FROM dbo.SchemaVersion WHERE Version = 2)
     INSERT INTO dbo.SchemaVersion (Version) VALUES (2);
+
+-- v3: state shared by all servers (single-use codes, ended SSO sessions, optional Data Protection keys)
+IF OBJECT_ID(N'dbo.SsoRedeemedCodes', N'U') IS NULL
+    CREATE TABLE dbo.SsoRedeemedCodes (
+        CodeId    nvarchar(64) NOT NULL CONSTRAINT PK_SsoRedeemedCodes PRIMARY KEY,
+        ExpiresAt datetime2    NOT NULL
+    );
+
+IF OBJECT_ID(N'dbo.SsoRevokedSessions', N'U') IS NULL
+    CREATE TABLE dbo.SsoRevokedSessions (
+        SessionId nvarchar(64) NOT NULL CONSTRAINT PK_SsoRevokedSessions PRIMARY KEY,
+        ExpiresAt datetime2    NOT NULL
+    );
+
+IF OBJECT_ID(N'dbo.DataProtectionKeys', N'U') IS NULL
+    CREATE TABLE dbo.DataProtectionKeys (
+        Id           int IDENTITY(1,1) NOT NULL CONSTRAINT PK_DataProtectionKeys PRIMARY KEY,
+        FriendlyName nvarchar(max)     NULL,
+        Xml          nvarchar(max)     NULL
+    );
+
+IF NOT EXISTS (SELECT 1 FROM dbo.SchemaVersion WHERE Version = 3)
+    INSERT INTO dbo.SchemaVersion (Version) VALUES (3);

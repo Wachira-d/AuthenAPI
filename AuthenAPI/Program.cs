@@ -45,14 +45,29 @@ catch (Exception ex)
 }
 builder.Services.AddSingleton(dataPaths);
 
-// Keys protect the admin session cookie and the stored service-account password.
-// Persisted so sessions and secrets survive app-pool recycles; DPAPI-encrypted at rest on Windows.
-var dataProtection = builder.Services.AddDataProtection()
-    .SetApplicationName("AuthenAPI")
-    .PersistKeysToFileSystem(new DirectoryInfo(dataPaths.DataProtectionKeysDirectory));
-if (OperatingSystem.IsWindows())
+// Keys protect the admin/SSO cookies, the stored service-account password and the SSO signing keys.
+//  - Single server (default): App_Data/keys, encrypted with DPAPI for this machine on Windows.
+//  - Several servers: DataProtection:StoreKeysInDatabase=true plus DataProtection:CertificateThumbprint of a
+//    certificate installed (with private key) on every server. DPAPI keys cannot be read on another machine.
+var dpSection = builder.Configuration.GetSection("DataProtection");
+var keysInDatabase = dpSection.GetValue<bool>("StoreKeysInDatabase") &&
+                     !string.IsNullOrWhiteSpace(builder.Configuration.GetConnectionString("AuthenAPI"));
+var certificate = LoadCertificate(dpSection["CertificateThumbprint"]);
+var dataProtection = builder.Services.AddDataProtection().SetApplicationName("AuthenAPI");
+if (keysInDatabase && certificate != null)
 {
-    dataProtection.ProtectKeysWithDpapi(protectToLocalMachine: true);
+    dataProtection.PersistKeysToDbContext<AuthenDbContext>().ProtectKeysWithCertificate(certificate);
+}
+else
+{
+    if (keysInDatabase)
+    {
+        Console.Error.WriteLine("DataProtection:StoreKeysInDatabase needs DataProtection:CertificateThumbprint (keys must not sit " +
+                                "unencrypted next to the data they protect). Using App_Data/keys instead.");
+    }
+    dataProtection.PersistKeysToFileSystem(new DirectoryInfo(dataPaths.DataProtectionKeysDirectory));
+    if (certificate != null) dataProtection.ProtectKeysWithCertificate(certificate);
+    else if (OperatingSystem.IsWindows()) dataProtection.ProtectKeysWithDpapi(protectToLocalMachine: true);
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +304,7 @@ app.MapGet("/health/ready", (HealthMonitorService health) => health.LastProbeOk 
     .ExcludeFromDescription();
 
 WarnIfNoAdmins(app);
+WarnAboutSsoExposure(app);
 
 app.Run();
 return 0;
@@ -297,6 +313,38 @@ static Task WriteJsonError(HttpResponse response, int statusCode, string message
 {
     response.StatusCode = statusCode;
     return response.WriteAsJsonAsync(ApiResponse.Fail(message));
+}
+
+static System.Security.Cryptography.X509Certificates.X509Certificate2? LoadCertificate(string? thumbprint)
+{
+    if (string.IsNullOrWhiteSpace(thumbprint)) return null;
+    using var store = new System.Security.Cryptography.X509Certificates.X509Store(
+        System.Security.Cryptography.X509Certificates.StoreName.My, System.Security.Cryptography.X509Certificates.StoreLocation.LocalMachine);
+    store.Open(System.Security.Cryptography.X509Certificates.OpenFlags.ReadOnly);
+    var found = store.Certificates.Find(System.Security.Cryptography.X509Certificates.X509FindType.FindByThumbprint,
+        thumbprint.Replace(" ", string.Empty), validOnly: false);
+    if (found.Count == 0)
+    {
+        Console.Error.WriteLine($"DataProtection certificate {thumbprint} not found in LocalMachine\\My");
+        return null;
+    }
+    return found[0];
+}
+
+static void WarnAboutSsoExposure(WebApplication app)
+{
+    var sso = app.Services.GetRequiredService<IOptionsMonitor<SsoSettings>>().CurrentValue;
+    if (!sso.Enabled) return;
+    if (string.IsNullOrWhiteSpace(sso.Issuer))
+    {
+        app.Logger.LogWarning("SsoSettings:Issuer is empty: the SSO issuer follows the request's Host header. " +
+                              "Set it to the public https URL, e.g. https://authen.hondacx.me/");
+    }
+    if (sso.AllowedIpAddresses.Count == 0)
+    {
+        app.Logger.LogWarning("SsoSettings:AllowedIpAddresses is empty: the SSO login page accepts sign-ins from any network. " +
+                              "Restrict it to office/VPN ranges plus the application servers if users only sign in internally.");
+    }
 }
 
 static void WarnIfNoAdmins(WebApplication app)

@@ -16,6 +16,7 @@ public class IpWhitelistMiddleware
     private readonly ILogger<IpWhitelistMiddleware> _logger;
     private readonly IOptionsMonitor<SecuritySettings> _security;
     private readonly IOptionsMonitor<AdminSettings> _admin;
+    private volatile IpNetworkMatcher _ssoMatcher;
     private volatile IpNetworkMatcher _apiMatcher;
     private volatile IpNetworkMatcher _adminMatcher;
 
@@ -23,7 +24,8 @@ public class IpWhitelistMiddleware
         RequestDelegate next,
         ILogger<IpWhitelistMiddleware> logger,
         IOptionsMonitor<SecuritySettings> security,
-        IOptionsMonitor<AdminSettings> admin)
+        IOptionsMonitor<AdminSettings> admin,
+        IOptionsMonitor<SsoSettings> sso)
     {
         _next = next;
         _logger = logger;
@@ -33,6 +35,8 @@ public class IpWhitelistMiddleware
         _adminMatcher = IpNetworkMatcher.Parse(admin.CurrentValue.AllowedIpAddresses);
         security.OnChange(s => _apiMatcher = IpNetworkMatcher.Parse(s.AllowedIpAddresses));
         admin.OnChange(a => _adminMatcher = IpNetworkMatcher.Parse(a.AllowedIpAddresses));
+        _ssoMatcher = IpNetworkMatcher.Parse(sso.CurrentValue.AllowedIpAddresses);
+        sso.OnChange(s => _ssoMatcher = IpNetworkMatcher.Parse(s.AllowedIpAddresses));
     }
 
     public async Task InvokeAsync(HttpContext context)
@@ -45,6 +49,12 @@ public class IpWhitelistMiddleware
         if (context.IsAdminPath() && !isLoopback && _adminMatcher.Count > 0 && !_adminMatcher.Contains(remoteIp))
         {
             await Reject(context, remoteIp, "Admin portal is not available from this IP address");
+            return;
+        }
+
+        if (context.IsSsoPath() && !isLoopback && _ssoMatcher.Count > 0 && !_ssoMatcher.Contains(remoteIp))
+        {
+            await Reject(context, remoteIp, "Single sign-on is not available from this network");
             return;
         }
 
